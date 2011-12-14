@@ -6,7 +6,14 @@ include $(CLEAR_VARS)
 
 # Set up the target identity
 LOCAL_MODULE := libv8
+
+# proteus:
+ifeq ($(PROTEUS_DEVICE_API), true)
+LOCAL_MODULE_CLASS := SHARED_LIBRARIES
+else
 LOCAL_MODULE_CLASS := STATIC_LIBRARIES
+endif
+
 intermediates := $(call local-intermediates-dir)
 
 PRIVATE_CLEAN_FILES := $(HOST_OUT)/bin/mksnapshot \
@@ -81,4 +88,12 @@ endif
 
 LOCAL_C_INCLUDES += bionic/libc/include $(LOCAL_PATH)/src
 
+# proteus: since libnode and libwebcore depend on libv8
+# we need to build v8 as a shared library
+ifeq ($(PROTEUS_DEVICE_API), true)
+LOCAL_CFLAGS += -DV8_SHARED
+LOCAL_SHARED_LIBRARIES += liblog
+include $(BUILD_SHARED_LIBRARY)
+else
 include $(BUILD_STATIC_LIBRARY)
+endif
