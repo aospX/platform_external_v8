@@ -1024,6 +1024,9 @@ class Isolate {
   }
 #endif
 
+  void SetData(void* data) { embedder_data_ = data; }
+  void* GetData() { return embedder_data_; }
+
   void ResetEagerOptimizingData();
 
  private:
@@ -1189,6 +1192,7 @@ class Isolate {
       regexp_macro_assembler_canonicalize_;
   RegExpStack* regexp_stack_;
   unibrow::Mapping<unibrow::Ecma262Canonicalize> interp_canonicalize_mapping_;
+  void* embedder_data_;
   ZoneObjectList frame_element_constant_list_;
   ZoneObjectList result_constant_list_;
 

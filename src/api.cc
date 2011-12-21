@@ -4695,6 +4695,17 @@ void Isolate::Exit() {
 }
 
 
+void Isolate::SetData(void* data) {
+  i::Isolate* isolate = reinterpret_cast<i::Isolate*>(this);
+  isolate->SetData(data);
+}
+
+void* Isolate::GetData() {
+  i::Isolate* isolate = reinterpret_cast<i::Isolate*>(this);
+  return isolate->GetData();
+}
+
+
 String::Utf8Value::Utf8Value(v8::Handle<v8::Value> obj) {
   i::Isolate* isolate = i::Isolate::Current();
   if (IsDeadCheck(isolate, "v8::String::Utf8Value::Utf8Value()")) return;
