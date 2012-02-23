@@ -26,10 +26,12 @@ BASE_PATH := $(call my-dir)
 #    can be set to true, so that two builds can be different but without
 #    specifying which JS engine to use.
 
+ifneq ($(DYNAMIC_SHARED_LIBV8SO),true)
 # Build libv8 and v8shell
 ifneq ($(filter $(TARGET_ARCH),x86 arm),)
     ENABLE_V8_SNAPSHOT = true
     include $(BASE_PATH)/Android.mksnapshot.mk
     include $(BASE_PATH)/Android.libv8.mk
     include $(BASE_PATH)/Android.v8shell.mk
+endif
 endif
