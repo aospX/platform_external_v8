@@ -30,7 +30,7 @@
 
 // The original source code covered by the above license above has been
 // modified significantly by Google Inc.
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 
 // A lightweight X64 Assembler.
 
@@ -45,22 +45,22 @@ namespace internal {
 // Utility functions
 
 // Test whether a 64-bit value is in a specific range.
-static inline bool is_uint32(int64_t x) {
+inline bool is_uint32(int64_t x) {
   static const uint64_t kMaxUInt32 = V8_UINT64_C(0xffffffff);
   return static_cast<uint64_t>(x) <= kMaxUInt32;
 }
 
-static inline bool is_int32(int64_t x) {
+inline bool is_int32(int64_t x) {
   static const int64_t kMinInt32 = -V8_INT64_C(0x80000000);
   return is_uint32(x - kMinInt32);
 }
 
-static inline bool uint_is_int32(uint64_t x) {
+inline bool uint_is_int32(uint64_t x) {
   static const uint64_t kMaxInt32 = V8_UINT64_C(0x7fffffff);
   return x <= kMaxInt32;
 }
 
-static inline bool is_uint32(uint64_t x) {
+inline bool is_uint32(uint64_t x) {
   static const uint64_t kMaxUInt32 = V8_UINT64_C(0xffffffff);
   return x <= kMaxUInt32;
 }
@@ -125,12 +125,14 @@ struct Register {
     return names[index];
   }
 
-  static Register toRegister(int code) {
+  static Register from_code(int code) {
     Register r = { code };
     return r;
   }
   bool is_valid() const { return 0 <= code_ && code_ < kNumRegisters; }
   bool is(Register reg) const { return code_ == reg.code_; }
+  // rax, rbx, rcx and rdx are byte registers, the rest are not.
+  bool is_byte_register() const { return code_ <= 3; }
   int code() const {
     ASSERT(is_valid());
     return code_;
@@ -159,23 +161,41 @@ struct Register {
   static const int kAllocationIndexByRegisterCode[kNumRegisters];
 };
 
-const Register rax = { 0 };
-const Register rcx = { 1 };
-const Register rdx = { 2 };
-const Register rbx = { 3 };
-const Register rsp = { 4 };
-const Register rbp = { 5 };
-const Register rsi = { 6 };
-const Register rdi = { 7 };
-const Register r8 = { 8 };
-const Register r9 = { 9 };
-const Register r10 = { 10 };
-const Register r11 = { 11 };
-const Register r12 = { 12 };
-const Register r13 = { 13 };
-const Register r14 = { 14 };
-const Register r15 = { 15 };
-const Register no_reg = { -1 };
+const int kRegister_rax_Code = 0;
+const int kRegister_rcx_Code = 1;
+const int kRegister_rdx_Code = 2;
+const int kRegister_rbx_Code = 3;
+const int kRegister_rsp_Code = 4;
+const int kRegister_rbp_Code = 5;
+const int kRegister_rsi_Code = 6;
+const int kRegister_rdi_Code = 7;
+const int kRegister_r8_Code = 8;
+const int kRegister_r9_Code = 9;
+const int kRegister_r10_Code = 10;
+const int kRegister_r11_Code = 11;
+const int kRegister_r12_Code = 12;
+const int kRegister_r13_Code = 13;
+const int kRegister_r14_Code = 14;
+const int kRegister_r15_Code = 15;
+const int kRegister_no_reg_Code = -1;
+
+const Register rax = { kRegister_rax_Code };
+const Register rcx = { kRegister_rcx_Code };
+const Register rdx = { kRegister_rdx_Code };
+const Register rbx = { kRegister_rbx_Code };
+const Register rsp = { kRegister_rsp_Code };
+const Register rbp = { kRegister_rbp_Code };
+const Register rsi = { kRegister_rsi_Code };
+const Register rdi = { kRegister_rdi_Code };
+const Register r8 = { kRegister_r8_Code };
+const Register r9 = { kRegister_r9_Code };
+const Register r10 = { kRegister_r10_Code };
+const Register r11 = { kRegister_r11_Code };
+const Register r12 = { kRegister_r12_Code };
+const Register r13 = { kRegister_r13_Code };
+const Register r14 = { kRegister_r14_Code };
+const Register r15 = { kRegister_r15_Code };
+const Register no_reg = { kRegister_no_reg_Code };
 
 
 struct XMMRegister {
@@ -215,6 +235,12 @@ struct XMMRegister {
     return names[index];
   }
 
+  static XMMRegister from_code(int code) {
+    ASSERT(code >= 0);
+    ASSERT(code < kNumRegisters);
+    XMMRegister r = { code };
+    return r;
+  }
   bool is_valid() const { return 0 <= code_ && code_ < kNumRegisters; }
   bool is(XMMRegister reg) const { return code_ == reg.code_; }
   int code() const {
@@ -324,22 +350,6 @@ inline Condition ReverseCondition(Condition cc) {
     default:
       return cc;
   };
-}
-
-
-enum Hint {
-  no_hint = 0,
-  not_taken = 0x2e,
-  taken = 0x3e
-};
-
-// The result of negating a hint is as if the corresponding condition
-// were negated by NegateCondition.  That is, no_hint is mapped to
-// itself and not_taken and taken are mapped to each other.
-inline Hint NegateHint(Hint hint) {
-  return (hint == no_hint)
-      ? no_hint
-      : ((hint == not_taken) ? taken : not_taken);
 }
 
 
@@ -469,6 +479,7 @@ class CpuFeatures : public AllStatic {
   // Enable a specified feature within a scope.
   class Scope BASE_EMBEDDED {
 #ifdef DEBUG
+
    public:
     explicit Scope(CpuFeature f) {
       uint64_t mask = V8_UINT64_C(1) << f;
@@ -488,10 +499,12 @@ class CpuFeatures : public AllStatic {
         isolate_->set_enabled_cpu_features(old_enabled_);
       }
     }
+
    private:
     Isolate* isolate_;
     uint64_t old_enabled_;
 #else
+
    public:
     explicit Scope(CpuFeature f) {}
 #endif
@@ -564,8 +577,8 @@ class Assembler : public AssemblerBase {
 
   // This sets the branch destination (which is in the instruction on x64).
   // This is for calls and branches within generated code.
-  inline static void set_target_at(Address instruction_payload,
-                                   Address target) {
+  inline static void deserialization_set_special_target_at(
+      Address instruction_payload, Address target) {
     set_target_address_at(instruction_payload, target);
   }
 
@@ -578,8 +591,7 @@ class Assembler : public AssemblerBase {
 
   inline Handle<Object> code_target_object_handle_at(Address pc);
   // Number of bytes taken up by the branch target in the code.
-  static const int kCallTargetSize = 4;      // Use 32-bit displacement.
-  static const int kExternalTargetSize = 8;  // Use 64-bit absolute.
+  static const int kSpecialTargetSize = 4;  // Use 32-bit displacement.
   // Distance between the address of the code target in the call instruction
   // and the return address pushed on the stack.
   static const int kCallTargetAddressOffset = 4;  // Use 32-bit displacement.
@@ -643,6 +655,7 @@ class Assembler : public AssemblerBase {
   // possible to align the pc offset to a multiple
   // of m, where m must be a power of 2.
   void Align(int m);
+  void Nop(int bytes = 1);
   // Aligns code to something that's optimal for a jump target for the platform.
   void CodeTargetAlign();
 
@@ -745,6 +758,10 @@ class Assembler : public AssemblerBase {
 
   void addl(const Operand& dst, Immediate src) {
     immediate_arithmetic_op_32(0x0, dst, src);
+  }
+
+  void addl(const Operand& dst, Register src) {
+    arithmetic_op_32(0x01, src, dst);
   }
 
   void addq(Register dst, Register src) {
@@ -1157,7 +1174,6 @@ class Assembler : public AssemblerBase {
   void hlt();
   void int3();
   void nop();
-  void nop(int n);
   void rdtsc();
   void ret(int imm16);
   void setcc(Condition cc, Register reg);
@@ -1178,12 +1194,13 @@ class Assembler : public AssemblerBase {
   // but it may be bound only once.
 
   void bind(Label* L);  // binds an unbound label L to the current code position
-  void bind(NearLabel* L);
 
   // Calls
   // Call near relative 32-bit displacement, relative to next instruction.
   void call(Label* L);
-  void call(Handle<Code> target, RelocInfo::Mode rmode);
+  void call(Handle<Code> target,
+            RelocInfo::Mode rmode = RelocInfo::CODE_TARGET,
+            unsigned ast_id = kNoASTId);
 
   // Calls directly to the given address using a relative offset.
   // Should only ever be used in Code objects for calls within the
@@ -1200,7 +1217,8 @@ class Assembler : public AssemblerBase {
   // Jumps
   // Jump short or near relative.
   // Use a 32-bit signed displacement.
-  void jmp(Label* L);  // unconditional jump to L
+  // Unconditional jump to L
+  void jmp(Label* L, Label::Distance distance = Label::kFar);
   void jmp(Handle<Code> target, RelocInfo::Mode rmode);
 
   // Jump near absolute indirect (r64)
@@ -1209,15 +1227,11 @@ class Assembler : public AssemblerBase {
   // Jump near absolute indirect (m64)
   void jmp(const Operand& src);
 
-  // Short jump
-  void jmp(NearLabel* L);
-
   // Conditional jumps
-  void j(Condition cc, Label* L);
+  void j(Condition cc,
+         Label* L,
+         Label::Distance distance = Label::kFar);
   void j(Condition cc, Handle<Code> target, RelocInfo::Mode rmode);
-
-  // Conditional short jump
-  void j(Condition cc, NearLabel* L, Hint hint = no_hint);
 
   // Floating-point operations
   void fld(int i);
@@ -1280,7 +1294,11 @@ class Assembler : public AssemblerBase {
 
   void fsin();
   void fcos();
+  void fptan();
   void fyl2x();
+  void f2xm1();
+  void fscale();
+  void fninit();
 
   void frndint();
 
@@ -1291,14 +1309,23 @@ class Assembler : public AssemblerBase {
   void movd(Register dst, XMMRegister src);
   void movq(XMMRegister dst, Register src);
   void movq(Register dst, XMMRegister src);
+  void movq(XMMRegister dst, XMMRegister src);
   void extractps(Register dst, XMMRegister src, byte imm8);
 
-  void movsd(const Operand& dst, XMMRegister src);
+  // Don't use this unless it's important to keep the
+  // top half of the destination register unchanged.
+  // Used movaps when moving double values and movq for integer
+  // values in xmm registers.
   void movsd(XMMRegister dst, XMMRegister src);
+
+  void movsd(const Operand& dst, XMMRegister src);
   void movsd(XMMRegister dst, const Operand& src);
 
   void movdqa(const Operand& dst, XMMRegister src);
   void movdqa(XMMRegister dst, const Operand& src);
+
+  void movapd(XMMRegister dst, XMMRegister src);
+  void movaps(XMMRegister dst, XMMRegister src);
 
   void movss(XMMRegister dst, const Operand& src);
   void movss(const Operand& dst, XMMRegister src);
@@ -1331,10 +1358,20 @@ class Assembler : public AssemblerBase {
   void andpd(XMMRegister dst, XMMRegister src);
   void orpd(XMMRegister dst, XMMRegister src);
   void xorpd(XMMRegister dst, XMMRegister src);
+  void xorps(XMMRegister dst, XMMRegister src);
   void sqrtsd(XMMRegister dst, XMMRegister src);
 
   void ucomisd(XMMRegister dst, XMMRegister src);
   void ucomisd(XMMRegister dst, const Operand& src);
+
+  enum RoundingMode {
+    kRoundToNearest = 0x0,
+    kRoundDown      = 0x1,
+    kRoundUp        = 0x2,
+    kRoundToZero    = 0x3
+  };
+
+  void roundsd(XMMRegister dst, XMMRegister src, RoundingMode mode);
 
   void movmskpd(Register dst, XMMRegister src);
 
@@ -1348,7 +1385,9 @@ class Assembler : public AssemblerBase {
   void Print();
 
   // Check the code size generated from label to here.
-  int SizeOfCodeGeneratedSince(Label* l) { return pc_offset() - l->pos(); }
+  int SizeOfCodeGeneratedSince(Label* label) {
+    return pc_offset() - label->pos();
+  }
 
   // Mark address of the ExitJSFrame code.
   void RecordJSReturn();
@@ -1381,19 +1420,20 @@ class Assembler : public AssemblerBase {
     return static_cast<int>(reloc_info_writer.pos() - pc_);
   }
 
-  static bool IsNop(Address addr) { return *addr == 0x90; }
+  static bool IsNop(Address addr);
 
   // Avoid overflows for displacements etc.
   static const int kMaximalBufferSize = 512*MB;
   static const int kMinimalBufferSize = 4*KB;
+
+  byte byte_at(int pos)  { return buffer_[pos]; }
+  void set_byte_at(int pos, byte value) { buffer_[pos] = value; }
 
  protected:
   bool emit_debug_code() const { return emit_debug_code_; }
 
  private:
   byte* addr_at(int pos)  { return buffer_ + pos; }
-  byte byte_at(int pos)  { return buffer_[pos]; }
-  void set_byte_at(int pos, byte value) { buffer_[pos] = value; }
   uint32_t long_at(int pos)  {
     return *reinterpret_cast<uint32_t*>(addr_at(pos));
   }
@@ -1408,7 +1448,9 @@ class Assembler : public AssemblerBase {
   inline void emitl(uint32_t x);
   inline void emitq(uint64_t x, RelocInfo::Mode rmode);
   inline void emitw(uint16_t x);
-  inline void emit_code_target(Handle<Code> target, RelocInfo::Mode rmode);
+  inline void emit_code_target(Handle<Code> target,
+                               RelocInfo::Mode rmode,
+                               unsigned ast_id = kNoASTId);
   void emit(Immediate x) { emitl(x.value_); }
 
   // Emits a REX prefix that encodes a 64-bit operand size and

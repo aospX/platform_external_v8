@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -30,28 +30,34 @@
 // Flags: --allow-natives-syntax
 
 // Check that an exception is thrown when null is passed as object.
+var exception = false;
 try {
   Object.defineProperty(null, null, null);
-  assertTrue(false);
 } catch (e) {
+  exception = true;
   assertTrue(/called on non-object/.test(e));
 }
+assertTrue(exception);
 
 // Check that an exception is thrown when undefined is passed as object.
+exception = false;
 try {
   Object.defineProperty(undefined, undefined, undefined);
-  assertTrue(false);
 } catch (e) {
+  exception = true;
   assertTrue(/called on non-object/.test(e));
 }
+assertTrue(exception);
 
 // Check that an exception is thrown when non-object is passed as object.
+exception = false;
 try {
   Object.defineProperty(0, "foo", undefined);
-  assertTrue(false);
 } catch (e) {
+  exception = true;
   assertTrue(/called on non-object/.test(e));
 }
+assertTrue(exception);
 
 // Object.
 var obj1 = {};
@@ -497,7 +503,7 @@ try {
 // Defining properties null should fail even when we have
 // other allowed values
 try {
-  %DefineOrRedefineAccessorProperty(null, 'foo', 0, func, 0);
+  %DefineOrRedefineAccessorProperty(null, 'foo', func, null, 0);
 } catch (e) {
   assertTrue(/illegal access/.test(e));
 }
@@ -695,12 +701,14 @@ Object.defineProperty(obj5, 'minuszero', descMinusZero);
 // Make sure we can redefine with -0.
 Object.defineProperty(obj5, 'minuszero', descMinusZero);
 
+exception = false;
 try {
   Object.defineProperty(obj5, 'minuszero', descPlusZero);
-  assertUnreachable();
 } catch (e) {
+  exception = true;
   assertTrue(/Cannot redefine property/.test(e));
 }
+assertTrue(exception);
 
 
 Object.defineProperty(obj5, 'pluszero', descPlusZero);
@@ -708,12 +716,14 @@ Object.defineProperty(obj5, 'pluszero', descPlusZero);
 // Make sure we can redefine with +0.
 Object.defineProperty(obj5, 'pluszero', descPlusZero);
 
+exception = false;
 try {
   Object.defineProperty(obj5, 'pluszero', descMinusZero);
-  assertUnreachable();
 } catch (e) {
+  exception = true;
   assertTrue(/Cannot redefine property/.test(e));
 }
+assertTrue(exception);
 
 
 var obj6 = {};
@@ -761,13 +771,15 @@ try {
 
 // Ensure that we can't change the descriptor of a
 // non configurable property.
+exception = false;
 try {
   var descAccessor = { get: function() { return 0; } };
   Object.defineProperty(obj6, '2', descAccessor);
-  assertUnreachable();
 } catch (e) {
+  exception = true;
   assertTrue(/Cannot redefine property/.test(e));
 }
+assertTrue(exception);
 
 Object.defineProperty(obj6, '2', descElementNonWritable);
 desc = Object.getOwnPropertyDescriptor(obj6, '2');
@@ -858,13 +870,15 @@ try {
 
 // Ensure that we can't change the descriptor of a
 // non configurable property.
+exception = false;
 try {
   var descAccessor = { get: function() { return 0; } };
   Object.defineProperty(arr, '2', descAccessor);
-  assertUnreachable();
 } catch (e) {
+  exception = true;
   assertTrue(/Cannot redefine property/.test(e));
 }
+assertTrue(exception);
 
 Object.defineProperty(arr, '2', descElementNonWritable);
 desc = Object.getOwnPropertyDescriptor(arr, '2');
@@ -1031,3 +1045,43 @@ Object.defineProperty(o, 'p',
 testDefineProperty(o, 'p',
   { enumerable : false, configurable : false },
   { get: undefined, set: setter1, enumerable : false, configurable : false });
+
+
+// Regression test: Ensure that growing dictionaries are not ignored.
+o = {};
+for (var i = 0; i < 1000; i++) {
+  // Non-enumerable property forces dictionary mode.
+  Object.defineProperty(o, i, {value: i, enumerable: false});
+}
+assertEquals(999, o[999]);
+
+
+// Regression test: Bizzare behavior on non-strict arguments object.
+(function test(arg0) {
+  // Here arguments[0] is a fast alias on arg0.
+  Object.defineProperty(arguments, "0", {
+    value:1,
+    enumerable:false
+  });
+  // Here arguments[0] is a slow alias on arg0.
+  Object.defineProperty(arguments, "0", {
+    value:2,
+    writable:false
+  });
+  // Here arguments[0] is no alias at all.
+  Object.defineProperty(arguments, "0", {
+    value:3
+  });
+  assertEquals(2, arg0);
+  assertEquals(3, arguments[0]);
+})(0);
+
+
+// Regression test: We should never observe the hole value.
+var objectWithGetter = {};
+objectWithGetter.__defineGetter__('foo', function() {});
+assertEquals(undefined, objectWithGetter.__lookupSetter__('foo'));
+
+var objectWithSetter = {};
+objectWithSetter.__defineSetter__('foo', function(x) {});
+assertEquals(undefined, objectWithSetter.__lookupGetter__('foo'));

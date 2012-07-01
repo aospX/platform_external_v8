@@ -30,12 +30,14 @@
 
 // The original source code covered by the above license above has been
 // modified significantly by Google Inc.
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 
 // A light-weight IA32 Assembler.
 
 #ifndef V8_IA32_ASSEMBLER_IA32_INL_H_
 #define V8_IA32_ASSEMBLER_IA32_INL_H_
+
+#include "ia32/assembler-ia32.h"
 
 #include "cpu.h"
 #include "debug.h"
@@ -78,19 +80,26 @@ Address RelocInfo::target_address() {
 
 
 Address RelocInfo::target_address_address() {
-  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY);
+  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY
+                              || rmode_ == EMBEDDED_OBJECT
+                              || rmode_ == EXTERNAL_REFERENCE);
   return reinterpret_cast<Address>(pc_);
 }
 
 
 int RelocInfo::target_address_size() {
-  return Assembler::kExternalTargetSize;
+  return Assembler::kSpecialTargetSize;
 }
 
 
-void RelocInfo::set_target_address(Address target) {
-  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY);
+void RelocInfo::set_target_address(Address target, WriteBarrierMode mode) {
   Assembler::set_target_address_at(pc_, target);
+  ASSERT(IsCodeTarget(rmode_) || rmode_ == RUNTIME_ENTRY);
+  if (mode == UPDATE_WRITE_BARRIER && host() != NULL && IsCodeTarget(rmode_)) {
+    Object* target_code = Code::GetCodeFromTargetAddress(target);
+    host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(
+        host(), this, HeapObject::cast(target_code));
+  }
 }
 
 
@@ -112,10 +121,16 @@ Object** RelocInfo::target_object_address() {
 }
 
 
-void RelocInfo::set_target_object(Object* target) {
+void RelocInfo::set_target_object(Object* target, WriteBarrierMode mode) {
   ASSERT(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
   Memory::Object_at(pc_) = target;
   CPU::FlushICache(pc_, sizeof(Address));
+  if (mode == UPDATE_WRITE_BARRIER &&
+      host() != NULL &&
+      target->IsHeapObject()) {
+    host()->GetHeap()->incremental_marking()->RecordWrite(
+        host(), &Memory::Object_at(pc_), HeapObject::cast(target));
+  }
 }
 
 
@@ -142,11 +157,18 @@ JSGlobalPropertyCell* RelocInfo::target_cell() {
 }
 
 
-void RelocInfo::set_target_cell(JSGlobalPropertyCell* cell) {
+void RelocInfo::set_target_cell(JSGlobalPropertyCell* cell,
+                                WriteBarrierMode mode) {
   ASSERT(rmode_ == RelocInfo::GLOBAL_PROPERTY_CELL);
   Address address = cell->address() + JSGlobalPropertyCell::kValueOffset;
   Memory::Address_at(pc_) = address;
   CPU::FlushICache(pc_, sizeof(Address));
+  if (mode == UPDATE_WRITE_BARRIER && host() != NULL) {
+    // TODO(1550) We are passing NULL as a slot because cell can never be on
+    // evacuation candidate.
+    host()->GetHeap()->incremental_marking()->RecordWrite(
+        host(), NULL, cell);
+  }
 }
 
 
@@ -161,6 +183,11 @@ void RelocInfo::set_call_address(Address target) {
   ASSERT((IsJSReturn(rmode()) && IsPatchedReturnSequence()) ||
          (IsDebugBreakSlot(rmode()) && IsPatchedDebugBreakSlotSequence()));
   Assembler::set_target_address_at(pc_ + 1, target);
+  if (host() != NULL) {
+    Object* target_code = Code::GetCodeFromTargetAddress(target);
+    host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(
+        host(), this, HeapObject::cast(target_code));
+  }
 }
 
 
@@ -194,14 +221,14 @@ bool RelocInfo::IsPatchedDebugBreakSlotSequence() {
 void RelocInfo::Visit(ObjectVisitor* visitor) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
-    visitor->VisitPointer(target_object_address());
+    visitor->VisitEmbeddedPointer(this);
     CPU::FlushICache(pc_, sizeof(Address));
   } else if (RelocInfo::IsCodeTarget(mode)) {
     visitor->VisitCodeTarget(this);
   } else if (mode == RelocInfo::GLOBAL_PROPERTY_CELL) {
     visitor->VisitGlobalPropertyCell(this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
-    visitor->VisitExternalReference(target_reference_address());
+    visitor->VisitExternalReference(this);
     CPU::FlushICache(pc_, sizeof(Address));
 #ifdef ENABLE_DEBUGGER_SUPPORT
   // TODO(isolates): Get a cached isolate below.
@@ -222,14 +249,14 @@ template<typename StaticVisitor>
 void RelocInfo::Visit(Heap* heap) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
-    StaticVisitor::VisitPointer(heap, target_object_address());
+    StaticVisitor::VisitEmbeddedPointer(heap, this);
     CPU::FlushICache(pc_, sizeof(Address));
   } else if (RelocInfo::IsCodeTarget(mode)) {
     StaticVisitor::VisitCodeTarget(heap, this);
   } else if (mode == RelocInfo::GLOBAL_PROPERTY_CELL) {
     StaticVisitor::VisitGlobalPropertyCell(heap, this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
-    StaticVisitor::VisitExternalReference(target_reference_address());
+    StaticVisitor::VisitExternalReference(this);
     CPU::FlushICache(pc_, sizeof(Address));
 #ifdef ENABLE_DEBUGGER_SUPPORT
   } else if (heap->isolate()->debug()->has_break_points() &&
@@ -311,8 +338,12 @@ void Assembler::emit(Handle<Object> handle) {
 }
 
 
-void Assembler::emit(uint32_t x, RelocInfo::Mode rmode) {
-  if (rmode != RelocInfo::NONE) RecordRelocInfo(rmode);
+void Assembler::emit(uint32_t x, RelocInfo::Mode rmode, unsigned id) {
+  if (rmode == RelocInfo::CODE_TARGET && id != kNoASTId) {
+    RecordRelocInfo(RelocInfo::CODE_TARGET_WITH_ID, static_cast<intptr_t>(id));
+  } else if (rmode != RelocInfo::NONE) {
+    RecordRelocInfo(rmode);
+  }
   emit(x);
 }
 
@@ -373,6 +404,18 @@ void Assembler::emit_disp(Label* L, Displacement::Type type) {
   Displacement disp(L, type);
   L->link_to(pc_offset());
   emit(static_cast<int>(disp.data()));
+}
+
+
+void Assembler::emit_near_disp(Label* L) {
+  byte disp = 0x00;
+  if (L->is_near_linked()) {
+    int offset = L->near_link_pos() - pc_offset();
+    ASSERT(is_int8(offset));
+    disp = static_cast<byte>(offset & 0xFF);
+  }
+  L->link_to(pc_offset(), Label::kNear);
+  *pc_++ = disp;
 }
 
 

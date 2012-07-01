@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -47,7 +47,7 @@ uint64_t CpuFeatures::found_by_runtime_probing_ = 0;
 
 
 void CpuFeatures::Probe() {
-  ASSERT(!initialized_);
+  ASSERT(supported_ == CpuFeatures::kDefaultCpuFeatures);
 #ifdef DEBUG
   initialized_ = true;
 #endif
@@ -383,7 +383,7 @@ Assembler::Assembler(Isolate* arg_isolate, void* buffer, int buffer_size)
   }
 #endif
 
-  // Setup buffer pointers.
+  // Set up buffer pointers.
   ASSERT(buffer_ != NULL);
   pc_ = buffer_;
   reloc_info_writer.Reposition(buffer_ + buffer_size, pc_);
@@ -412,7 +412,7 @@ void Assembler::GetCode(CodeDesc* desc) {
   // Finalize code (at this point overflow() may be true, but the gap ensures
   // that we are still not overlapping instructions and relocation info).
   ASSERT(pc_ <= reloc_info_writer.pos());  // No overlap.
-  // Setup code descriptor.
+  // Set up code descriptor.
   desc->buffer = buffer_;
   desc->buffer_size = buffer_size_;
   desc->instr_size = pc_offset();
@@ -426,18 +426,21 @@ void Assembler::GetCode(CodeDesc* desc) {
 void Assembler::Align(int m) {
   ASSERT(IsPowerOf2(m));
   int delta = (m - (pc_offset() & (m - 1))) & (m - 1);
-  while (delta >= 9) {
-    nop(9);
-    delta -= 9;
-  }
-  if (delta > 0) {
-    nop(delta);
-  }
+  Nop(delta);
 }
 
 
 void Assembler::CodeTargetAlign() {
   Align(16);  // Preferred alignment of jump targets on x64.
+}
+
+
+bool Assembler::IsNop(Address addr) {
+  Address a = addr;
+  while (*a == 0x66) a++;
+  if (*a == 0x90) return true;
+  if (a[0] == 0xf && a[1] == 0x1f) return true;
+  return false;
 }
 
 
@@ -458,25 +461,26 @@ void Assembler::bind_to(Label* L, int pos) {
     int last_imm32 = pos - (current + sizeof(int32_t));
     long_at_put(current, last_imm32);
   }
+  while (L->is_near_linked()) {
+    int fixup_pos = L->near_link_pos();
+    int offset_to_next =
+        static_cast<int>(*reinterpret_cast<int8_t*>(addr_at(fixup_pos)));
+    ASSERT(offset_to_next <= 0);
+    int disp = pos - (fixup_pos + sizeof(int8_t));
+    ASSERT(is_int8(disp));
+    set_byte_at(fixup_pos, disp);
+    if (offset_to_next < 0) {
+      L->link_to(fixup_pos + offset_to_next, Label::kNear);
+    } else {
+      L->UnuseNear();
+    }
+  }
   L->bind_to(pos);
 }
 
 
 void Assembler::bind(Label* L) {
   bind_to(L, pc_offset());
-}
-
-
-void Assembler::bind(NearLabel* L) {
-  ASSERT(!L->is_bound());
-  while (L->unresolved_branches_ > 0) {
-    int branch_pos = L->unresolved_positions_[L->unresolved_branches_ - 1];
-    int disp = pc_offset() - branch_pos;
-    ASSERT(is_int8(disp));
-    set_byte_at(branch_pos - sizeof(int8_t), disp);
-    L->unresolved_branches_--;
-  }
-  L->bind_to(pc_offset());
 }
 
 
@@ -498,7 +502,7 @@ void Assembler::GrowBuffer() {
     V8::FatalProcessOutOfMemory("Assembler::GrowBuffer");
   }
 
-  // Setup new buffer.
+  // Set up new buffer.
   desc.buffer = NewArray<byte>(desc.buffer_size);
   desc.instr_size = pc_offset();
   desc.reloc_size =
@@ -771,7 +775,7 @@ void Assembler::immediate_arithmetic_op_8(byte subcode,
                                           Register dst,
                                           Immediate src) {
   EnsureSpace ensure_space(this);
-  if (dst.code() > 3) {
+  if (!dst.is_byte_register()) {
     // Use 64-bit mode byte registers.
     emit_rex_64(dst);
   }
@@ -869,12 +873,14 @@ void Assembler::call(Label* L) {
 }
 
 
-void Assembler::call(Handle<Code> target, RelocInfo::Mode rmode) {
+void Assembler::call(Handle<Code> target,
+                     RelocInfo::Mode rmode,
+                     unsigned ast_id) {
   positions_recorder()->WriteRecordedPositions();
   EnsureSpace ensure_space(this);
   // 1110 1000 #32-bit disp.
   emit(0xE8);
-  emit_code_target(target, rmode);
+  emit_code_target(target, rmode, ast_id);
 }
 
 
@@ -1053,7 +1059,7 @@ void Assembler::decl(const Operand& dst) {
 
 void Assembler::decb(Register dst) {
   EnsureSpace ensure_space(this);
-  if (dst.code() > 3) {
+  if (!dst.is_byte_register()) {
     // Register is not one of al, bl, cl, dl.  Its encoding needs REX.
     emit_rex_32(dst);
   }
@@ -1212,7 +1218,7 @@ void Assembler::int3() {
 }
 
 
-void Assembler::j(Condition cc, Label* L) {
+void Assembler::j(Condition cc, Label* L, Label::Distance distance) {
   if (cc == always) {
     jmp(L);
     return;
@@ -1236,6 +1242,17 @@ void Assembler::j(Condition cc, Label* L) {
       emit(0x80 | cc);
       emitl(offs - long_size);
     }
+  } else if (distance == Label::kNear) {
+    // 0111 tttn #8-bit disp
+    emit(0x70 | cc);
+    byte disp = 0x00;
+    if (L->is_near_linked()) {
+      int offset = L->near_link_pos() - pc_offset();
+      ASSERT(is_int8(offset));
+      disp = static_cast<byte>(offset & 0xFF);
+    }
+    L->link_to(pc_offset(), Label::kNear);
+    emit(disp);
   } else if (L->is_linked()) {
     // 0000 1111 1000 tttn #32-bit disp.
     emit(0x0F);
@@ -1265,27 +1282,7 @@ void Assembler::j(Condition cc,
 }
 
 
-void Assembler::j(Condition cc, NearLabel* L, Hint hint) {
-  EnsureSpace ensure_space(this);
-  ASSERT(0 <= cc && cc < 16);
-  if (FLAG_emit_branch_hints && hint != no_hint) emit(hint);
-  if (L->is_bound()) {
-    const int short_size = 2;
-    int offs = L->pos() - pc_offset();
-    ASSERT(offs <= 0);
-    ASSERT(is_int8(offs - short_size));
-    // 0111 tttn #8-bit disp
-    emit(0x70 | cc);
-    emit((offs - short_size) & 0xFF);
-  } else {
-    emit(0x70 | cc);
-    emit(0x00);      // The displacement will be resolved later.
-    L->link_to(pc_offset());
-  }
-}
-
-
-void Assembler::jmp(Label* L) {
+void Assembler::jmp(Label* L, Label::Distance distance) {
   EnsureSpace ensure_space(this);
   const int short_size = sizeof(int8_t);
   const int long_size = sizeof(int32_t);
@@ -1301,7 +1298,17 @@ void Assembler::jmp(Label* L) {
       emit(0xE9);
       emitl(offs - long_size);
     }
-  } else  if (L->is_linked()) {
+  } else if (distance == Label::kNear) {
+    emit(0xEB);
+    byte disp = 0x00;
+    if (L->is_near_linked()) {
+      int offset = L->near_link_pos() - pc_offset();
+      ASSERT(is_int8(offset));
+      disp = static_cast<byte>(offset & 0xFF);
+    }
+    L->link_to(pc_offset(), Label::kNear);
+    emit(disp);
+  } else if (L->is_linked()) {
     // 1110 1001 #32-bit disp.
     emit(0xE9);
     emitl(L->pos());
@@ -1322,24 +1329,6 @@ void Assembler::jmp(Handle<Code> target, RelocInfo::Mode rmode) {
   // 1110 1001 #32-bit disp.
   emit(0xE9);
   emit_code_target(target, rmode);
-}
-
-
-void Assembler::jmp(NearLabel* L) {
-  EnsureSpace ensure_space(this);
-  if (L->is_bound()) {
-    const int short_size = 2;
-    int offs = L->pos() - pc_offset();
-    ASSERT(offs <= 0);
-    ASSERT(is_int8(offs - short_size));
-    // 1110 1011 #8-bit disp.
-    emit(0xEB);
-    emit((offs - short_size) & 0xFF);
-  } else {
-    emit(0xEB);
-    emit(0x00);      // The displacement will be resolved later.
-    L->link_to(pc_offset());
-  }
 }
 
 
@@ -1398,7 +1387,7 @@ void Assembler::leave() {
 
 void Assembler::movb(Register dst, const Operand& src) {
   EnsureSpace ensure_space(this);
-  if (dst.code() > 3) {
+  if (!dst.is_byte_register()) {
     // Register is not one of al, bl, cl, dl.  Its encoding needs REX.
     emit_rex_32(dst, src);
   } else {
@@ -1411,7 +1400,7 @@ void Assembler::movb(Register dst, const Operand& src) {
 
 void Assembler::movb(Register dst, Immediate imm) {
   EnsureSpace ensure_space(this);
-  if (dst.code() > 3) {
+  if (!dst.is_byte_register()) {
     emit_rex_32(dst);
   }
   emit(0xB0 + dst.low_bits());
@@ -1421,7 +1410,7 @@ void Assembler::movb(Register dst, Immediate imm) {
 
 void Assembler::movb(const Operand& dst, Register src) {
   EnsureSpace ensure_space(this);
-  if (src.code() > 3) {
+  if (!src.is_byte_register()) {
     emit_rex_32(src, dst);
   } else {
     emit_optional_rex_32(src, dst);
@@ -1651,6 +1640,8 @@ void Assembler::movsxlq(Register dst, const Operand& src) {
 
 void Assembler::movzxbq(Register dst, const Operand& src) {
   EnsureSpace ensure_space(this);
+  // 32 bit operations zero the top 32 bits of 64 bit registers.  Therefore
+  // there is no need to make this a 64 bit operation.
   emit_optional_rex_32(dst, src);
   emit(0x0F);
   emit(0xB6);
@@ -1777,7 +1768,7 @@ void Assembler::notl(Register dst) {
 }
 
 
-void Assembler::nop(int n) {
+void Assembler::Nop(int n) {
   // The recommended muti-byte sequences of NOP instructions from the Intel 64
   // and IA-32 Architectures Software Developer's Manual.
   //
@@ -1792,73 +1783,64 @@ void Assembler::nop(int n) {
   // 9 bytes  66 NOP DWORD ptr [EAX + EAX*1 +         66 0F 1F 84 00 00 00 00
   //          00000000H]                              00H
 
-  ASSERT(1 <= n);
-  ASSERT(n <= 9);
   EnsureSpace ensure_space(this);
-  switch (n) {
-  case 1:
-    emit(0x90);
-    return;
-  case 2:
-    emit(0x66);
-    emit(0x90);
-    return;
-  case 3:
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x00);
-    return;
-  case 4:
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x40);
-    emit(0x00);
-    return;
-  case 5:
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x44);
-    emit(0x00);
-    emit(0x00);
-    return;
-  case 6:
-    emit(0x66);
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x44);
-    emit(0x00);
-    emit(0x00);
-    return;
-  case 7:
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x80);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    return;
-  case 8:
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x84);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    return;
-  case 9:
-    emit(0x66);
-    emit(0x0f);
-    emit(0x1f);
-    emit(0x84);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    emit(0x00);
-    return;
+  while (n > 0) {
+    switch (n) {
+      case 2:
+        emit(0x66);
+      case 1:
+        emit(0x90);
+        return;
+      case 3:
+        emit(0x0f);
+        emit(0x1f);
+        emit(0x00);
+        return;
+      case 4:
+        emit(0x0f);
+        emit(0x1f);
+        emit(0x40);
+        emit(0x00);
+        return;
+      case 6:
+        emit(0x66);
+      case 5:
+        emit(0x0f);
+        emit(0x1f);
+        emit(0x44);
+        emit(0x00);
+        emit(0x00);
+        return;
+      case 7:
+        emit(0x0f);
+        emit(0x1f);
+        emit(0x80);
+        emit(0x00);
+        emit(0x00);
+        emit(0x00);
+        emit(0x00);
+        return;
+      default:
+      case 11:
+        emit(0x66);
+        n--;
+      case 10:
+        emit(0x66);
+        n--;
+      case 9:
+        emit(0x66);
+        n--;
+      case 8:
+        emit(0x0f);
+        emit(0x1f);
+        emit(0x84);
+        emit(0x00);
+        emit(0x00);
+        emit(0x00);
+        emit(0x00);
+        emit(0x00);
+        n -= 8;
+    }
   }
 }
 
@@ -1951,7 +1933,7 @@ void Assembler::setcc(Condition cc, Register reg) {
   }
   EnsureSpace ensure_space(this);
   ASSERT(is_uint4(cc));
-  if (reg.code() > 3) {  // Use x64 byte registers, where different.
+  if (!reg.is_byte_register()) {  // Use x64 byte registers, where different.
     emit_rex_32(reg);
   }
   emit(0x0F);
@@ -2016,7 +1998,7 @@ void Assembler::testb(Register dst, Register src) {
     emit(0x84);
     emit_modrm(src, dst);
   } else {
-    if (dst.code() > 3 || src.code() > 3) {
+    if (!dst.is_byte_register() || !src.is_byte_register()) {
       // Register is not one of al, bl, cl, dl.  Its encoding needs REX.
       emit_rex_32(dst, src);
     }
@@ -2033,7 +2015,7 @@ void Assembler::testb(Register reg, Immediate mask) {
     emit(0xA8);
     emit(mask.value_);  // Low byte emitted.
   } else {
-    if (reg.code() > 3) {
+    if (!reg.is_byte_register()) {
       // Register is not one of al, bl, cl, dl.  Its encoding needs REX.
       emit_rex_32(reg);
     }
@@ -2056,7 +2038,7 @@ void Assembler::testb(const Operand& op, Immediate mask) {
 
 void Assembler::testb(const Operand& op, Register reg) {
   EnsureSpace ensure_space(this);
-  if (reg.code() > 3) {
+  if (!reg.is_byte_register()) {
     // Register is not one of al, bl, cl, dl.  Its encoding needs REX.
     emit_rex_32(reg, op);
   } else {
@@ -2313,10 +2295,38 @@ void Assembler::fsin() {
 }
 
 
+void Assembler::fptan() {
+  EnsureSpace ensure_space(this);
+  emit(0xD9);
+  emit(0xF2);
+}
+
+
 void Assembler::fyl2x() {
   EnsureSpace ensure_space(this);
   emit(0xD9);
   emit(0xF1);
+}
+
+
+void Assembler::f2xm1() {
+  EnsureSpace ensure_space(this);
+  emit(0xD9);
+  emit(0xF0);
+}
+
+
+void Assembler::fscale() {
+  EnsureSpace ensure_space(this);
+  emit(0xD9);
+  emit(0xFD);
+}
+
+
+void Assembler::fninit() {
+  EnsureSpace ensure_space(this);
+  emit(0xDB);
+  emit(0xE3);
 }
 
 
@@ -2540,6 +2550,24 @@ void Assembler::movq(Register dst, XMMRegister src) {
 }
 
 
+void Assembler::movq(XMMRegister dst, XMMRegister src) {
+  EnsureSpace ensure_space(this);
+  if (dst.low_bits() == 4) {
+    // Avoid unnecessary SIB byte.
+    emit(0xf3);
+    emit_optional_rex_32(dst, src);
+    emit(0x0F);
+    emit(0x7e);
+    emit_sse_operand(dst, src);
+  } else {
+    emit(0x66);
+    emit_optional_rex_32(src, dst);
+    emit(0x0F);
+    emit(0xD6);
+    emit_sse_operand(src, dst);
+  }
+}
+
 void Assembler::movdqa(const Operand& dst, XMMRegister src) {
   EnsureSpace ensure_space(this);
   emit(0x66);
@@ -2561,7 +2589,8 @@ void Assembler::movdqa(XMMRegister dst, const Operand& src) {
 
 
 void Assembler::extractps(Register dst, XMMRegister src, byte imm8) {
-  ASSERT(is_uint2(imm8));
+  ASSERT(CpuFeatures::IsSupported(SSE4_1));
+  ASSERT(is_uint8(imm8));
   EnsureSpace ensure_space(this);
   emit(0x66);
   emit_optional_rex_32(dst, src);
@@ -2600,6 +2629,42 @@ void Assembler::movsd(XMMRegister dst, const Operand& src) {
   emit(0x0F);
   emit(0x10);  // load
   emit_sse_operand(dst, src);
+}
+
+
+void Assembler::movaps(XMMRegister dst, XMMRegister src) {
+  EnsureSpace ensure_space(this);
+  if (src.low_bits() == 4) {
+    // Try to avoid an unnecessary SIB byte.
+    emit_optional_rex_32(src, dst);
+    emit(0x0F);
+    emit(0x29);
+    emit_sse_operand(src, dst);
+  } else {
+    emit_optional_rex_32(dst, src);
+    emit(0x0F);
+    emit(0x28);
+    emit_sse_operand(dst, src);
+  }
+}
+
+
+void Assembler::movapd(XMMRegister dst, XMMRegister src) {
+  EnsureSpace ensure_space(this);
+  if (src.low_bits() == 4) {
+    // Try to avoid an unnecessary SIB byte.
+    emit(0x66);
+    emit_optional_rex_32(src, dst);
+    emit(0x0F);
+    emit(0x29);
+    emit_sse_operand(src, dst);
+  } else {
+    emit(0x66);
+    emit_optional_rex_32(dst, src);
+    emit(0x0F);
+    emit(0x28);
+    emit_sse_operand(dst, src);
+  }
 }
 
 
@@ -2833,6 +2898,15 @@ void Assembler::xorpd(XMMRegister dst, XMMRegister src) {
 }
 
 
+void Assembler::xorps(XMMRegister dst, XMMRegister src) {
+  EnsureSpace ensure_space(this);
+  emit_optional_rex_32(dst, src);
+  emit(0x0F);
+  emit(0x57);
+  emit_sse_operand(dst, src);
+}
+
+
 void Assembler::sqrtsd(XMMRegister dst, XMMRegister src) {
   EnsureSpace ensure_space(this);
   emit(0xF2);
@@ -2860,6 +2934,21 @@ void Assembler::ucomisd(XMMRegister dst, const Operand& src) {
   emit(0x0f);
   emit(0x2e);
   emit_sse_operand(dst, src);
+}
+
+
+void Assembler::roundsd(XMMRegister dst, XMMRegister src,
+                        Assembler::RoundingMode mode) {
+  ASSERT(CpuFeatures::IsEnabled(SSE4_1));
+  EnsureSpace ensure_space(this);
+  emit(0x66);
+  emit_optional_rex_32(dst, src);
+  emit(0x0f);
+  emit(0x3a);
+  emit(0x0b);
+  emit_sse_operand(dst, src);
+  // Mask precision exeption.
+  emit(static_cast<byte>(mode) | 0x8);
 }
 
 
@@ -2919,7 +3008,7 @@ void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
       return;
     }
   }
-  RelocInfo rinfo(pc_, rmode, data);
+  RelocInfo rinfo(pc_, rmode, data, NULL);
   reloc_info_writer.Write(&rinfo);
 }
 
@@ -2955,8 +3044,6 @@ bool RelocInfo::IsCodedSpecially() {
   // by branch instructions.
   return (1 << rmode_) & kApplyMask;
 }
-
-
 
 } }  // namespace v8::internal
 

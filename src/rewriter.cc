@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -42,11 +42,17 @@ class Processor: public AstVisitor {
       : result_(result),
         result_assigned_(false),
         is_set_(false),
-        in_try_(false) {
-  }
+        in_try_(false),
+        factory_(isolate()) { }
+
+  virtual ~Processor() { }
 
   void Process(ZoneList<Statement*>* statements);
   bool result_assigned() const { return result_assigned_; }
+
+  AstNodeFactory<AstNullVisitor>* factory() {
+    return &factory_;
+  }
 
  private:
   Variable* result_;
@@ -64,11 +70,13 @@ class Processor: public AstVisitor {
   bool is_set_;
   bool in_try_;
 
+  AstNodeFactory<AstNullVisitor> factory_;
+
   Expression* SetResult(Expression* value) {
     result_assigned_ = true;
-    VariableProxy* result_proxy = new VariableProxy(result_);
-    return new Assignment(Token::ASSIGN, result_proxy, value,
-                          RelocInfo::kNoPosition);
+    VariableProxy* result_proxy = factory()->NewVariableProxy(result_);
+    return factory()->NewAssignment(
+        Token::ASSIGN, result_proxy, value, RelocInfo::kNoPosition);
   }
 
   // Node visitors.
@@ -193,141 +201,33 @@ void Processor::VisitBreakStatement(BreakStatement* node) {
 }
 
 
+void Processor::VisitWithStatement(WithStatement* node) {
+  bool set_after_body = is_set_;
+  Visit(node->statement());
+  is_set_ = is_set_ && set_after_body;
+}
+
+
 // Do nothing:
-void Processor::VisitDeclaration(Declaration* node) {}
+void Processor::VisitVariableDeclaration(VariableDeclaration* node) {}
+void Processor::VisitFunctionDeclaration(FunctionDeclaration* node) {}
+void Processor::VisitModuleDeclaration(ModuleDeclaration* node) {}
+void Processor::VisitImportDeclaration(ImportDeclaration* node) {}
+void Processor::VisitExportDeclaration(ExportDeclaration* node) {}
+void Processor::VisitModuleLiteral(ModuleLiteral* node) {}
+void Processor::VisitModuleVariable(ModuleVariable* node) {}
+void Processor::VisitModulePath(ModulePath* node) {}
+void Processor::VisitModuleUrl(ModuleUrl* node) {}
 void Processor::VisitEmptyStatement(EmptyStatement* node) {}
 void Processor::VisitReturnStatement(ReturnStatement* node) {}
-void Processor::VisitWithEnterStatement(WithEnterStatement* node) {}
-void Processor::VisitWithExitStatement(WithExitStatement* node) {}
 void Processor::VisitDebuggerStatement(DebuggerStatement* node) {}
 
 
 // Expressions are never visited yet.
-void Processor::VisitFunctionLiteral(FunctionLiteral* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitSharedFunctionInfoLiteral(
-    SharedFunctionInfoLiteral* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitConditional(Conditional* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitVariableProxy(VariableProxy* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitLiteral(Literal* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitRegExpLiteral(RegExpLiteral* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitArrayLiteral(ArrayLiteral* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitObjectLiteral(ObjectLiteral* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCatchExtensionObject(CatchExtensionObject* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitAssignment(Assignment* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitThrow(Throw* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitProperty(Property* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCall(Call* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCallNew(CallNew* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCallRuntime(CallRuntime* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitUnaryOperation(UnaryOperation* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCountOperation(CountOperation* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitBinaryOperation(BinaryOperation* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCompareOperation(CompareOperation* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitCompareToNull(CompareToNull* node) {
-  USE(node);
-  UNREACHABLE();
-}
-
-
-void Processor::VisitThisFunction(ThisFunction* node) {
-  USE(node);
-  UNREACHABLE();
-}
+#define DEF_VISIT(type)                                         \
+  void Processor::Visit##type(type* expr) { UNREACHABLE(); }
+EXPRESSION_NODE_LIST(DEF_VISIT)
+#undef DEF_VISIT
 
 
 // Assumes code has been parsed and scopes have been analyzed.  Mutates the
@@ -337,7 +237,7 @@ bool Rewriter::Rewrite(CompilationInfo* info) {
   ASSERT(function != NULL);
   Scope* scope = function->scope();
   ASSERT(scope != NULL);
-  if (scope->is_function_scope()) return true;
+  if (!scope->is_global_scope() && !scope->is_eval_scope()) return true;
 
   ZoneList<Statement*>* body = function->body();
   if (!body->is_empty()) {
@@ -348,8 +248,21 @@ bool Rewriter::Rewrite(CompilationInfo* info) {
     if (processor.HasStackOverflow()) return false;
 
     if (processor.result_assigned()) {
-      VariableProxy* result_proxy = new VariableProxy(result);
-      body->Add(new ReturnStatement(result_proxy));
+      ASSERT(function->end_position() != RelocInfo::kNoPosition);
+      // Set the position of the assignment statement one character past the
+      // source code, such that it definitely is not in the source code range
+      // of an immediate inner scope. For example in
+      //   eval('with ({x:1}) x = 1');
+      // the end position of the function generated for executing the eval code
+      // coincides with the end of the with scope which is the position of '1'.
+      int position = function->end_position();
+      VariableProxy* result_proxy = processor.factory()->NewVariableProxy(
+          result->name(), false, position);
+      result_proxy->BindTo(result);
+      Statement* result_statement =
+          processor.factory()->NewReturnStatement(result_proxy);
+      result_statement->set_statement_pos(position);
+      body->Add(result_statement);
     }
   }
 

@@ -1,4 +1,4 @@
-// Copyright 2008 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,10 +28,14 @@
 #ifndef V8_API_H_
 #define V8_API_H_
 
-#include "apiutils.h"
-#include "factory.h"
+#include "v8.h"
 
 #include "../include/v8-testing.h"
+#include "apiutils.h"
+#include "contexts.h"
+#include "factory.h"
+#include "isolate.h"
+#include "list-inl.h"
 
 namespace v8 {
 
@@ -112,17 +116,18 @@ void NeanderObject::set(int offset, v8::internal::Object* value) {
 }
 
 
-template <typename T> static inline T ToCData(v8::internal::Object* obj) {
+template <typename T> inline T ToCData(v8::internal::Object* obj) {
   STATIC_ASSERT(sizeof(T) == sizeof(v8::internal::Address));
   return reinterpret_cast<T>(
-      reinterpret_cast<intptr_t>(v8::internal::Proxy::cast(obj)->proxy()));
+      reinterpret_cast<intptr_t>(
+          v8::internal::Foreign::cast(obj)->foreign_address()));
 }
 
 
 template <typename T>
-static inline v8::internal::Handle<v8::internal::Object> FromCData(T obj) {
+inline v8::internal::Handle<v8::internal::Object> FromCData(T obj) {
   STATIC_ASSERT(sizeof(T) == sizeof(v8::internal::Address));
-  return FACTORY->NewProxy(
+  return FACTORY->NewForeign(
       reinterpret_cast<v8::internal::Address>(reinterpret_cast<intptr_t>(obj)));
 }
 
@@ -136,10 +141,6 @@ class ApiFunction {
 };
 
 
-enum ExtensionTraversalState {
-  UNVISITED, VISITED, INSTALLED
-};
-
 
 class RegisteredExtension {
  public:
@@ -148,14 +149,11 @@ class RegisteredExtension {
   Extension* extension() { return extension_; }
   RegisteredExtension* next() { return next_; }
   RegisteredExtension* next_auto() { return next_auto_; }
-  ExtensionTraversalState state() { return state_; }
-  void set_state(ExtensionTraversalState value) { state_ = value; }
   static RegisteredExtension* first_extension() { return first_extension_; }
  private:
   Extension* extension_;
   RegisteredExtension* next_;
   RegisteredExtension* next_auto_;
-  ExtensionTraversalState state_;
   static RegisteredExtension* first_extension_;
 };
 
@@ -182,7 +180,7 @@ class Utils {
   static inline Local<Array> ToLocal(
       v8::internal::Handle<v8::internal::JSArray> obj);
   static inline Local<External> ToLocal(
-      v8::internal::Handle<v8::internal::Proxy> obj);
+      v8::internal::Handle<v8::internal::Foreign> obj);
   static inline Local<Message> MessageToLocal(
       v8::internal::Handle<v8::internal::Object> obj);
   static inline Local<StackTrace> StackTraceToLocal(
@@ -236,13 +234,13 @@ class Utils {
       OpenHandle(const v8::Signature* sig);
   static inline v8::internal::Handle<v8::internal::TypeSwitchInfo>
       OpenHandle(const v8::TypeSwitch* that);
-  static inline v8::internal::Handle<v8::internal::Proxy>
+  static inline v8::internal::Handle<v8::internal::Foreign>
       OpenHandle(const v8::External* that);
 };
 
 
 template <class T>
-static inline T* ToApi(v8::internal::Handle<v8::internal::Object> obj) {
+inline T* ToApi(v8::internal::Handle<v8::internal::Object> obj) {
   return reinterpret_cast<T*>(obj.location());
 }
 
@@ -273,7 +271,7 @@ MAKE_TO_LOCAL(ToLocal, String, String)
 MAKE_TO_LOCAL(ToLocal, JSRegExp, RegExp)
 MAKE_TO_LOCAL(ToLocal, JSObject, Object)
 MAKE_TO_LOCAL(ToLocal, JSArray, Array)
-MAKE_TO_LOCAL(ToLocal, Proxy, External)
+MAKE_TO_LOCAL(ToLocal, Foreign, External)
 MAKE_TO_LOCAL(ToLocal, FunctionTemplateInfo, FunctionTemplate)
 MAKE_TO_LOCAL(ToLocal, ObjectTemplateInfo, ObjectTemplate)
 MAKE_TO_LOCAL(ToLocal, SignatureInfo, Signature)
@@ -311,7 +309,7 @@ MAKE_OPEN_HANDLE(Script, Object)
 MAKE_OPEN_HANDLE(Function, JSFunction)
 MAKE_OPEN_HANDLE(Message, JSObject)
 MAKE_OPEN_HANDLE(Context, Context)
-MAKE_OPEN_HANDLE(External, Proxy)
+MAKE_OPEN_HANDLE(External, Foreign)
 MAKE_OPEN_HANDLE(StackTrace, JSArray)
 MAKE_OPEN_HANDLE(StackFrame, JSObject)
 
@@ -396,15 +394,19 @@ class StringTracker {
 // data. In multithreaded V8 programs this data is copied in and out of storage
 // so that the currently executing thread always has its own copy of this
 // data.
-ISOLATED_CLASS HandleScopeImplementer {
+class HandleScopeImplementer {
  public:
-
-  HandleScopeImplementer()
-      : blocks_(0),
+  explicit HandleScopeImplementer(Isolate* isolate)
+      : isolate_(isolate),
+        blocks_(0),
         entered_contexts_(0),
         saved_contexts_(0),
         spare_(NULL),
         call_depth_(0) { }
+
+  ~HandleScopeImplementer() {
+    DeleteArray(spare_);
+  }
 
   // Threading support for handle data.
   static int ArchiveSpacePerThread();
@@ -460,6 +462,7 @@ ISOLATED_CLASS HandleScopeImplementer {
     ASSERT(call_depth_ == 0);
   }
 
+  Isolate* isolate_;
   List<internal::Object**> blocks_;
   // Used as a stack to keep track of entered contexts.
   List<Handle<Object> > entered_contexts_;
@@ -478,7 +481,7 @@ ISOLATED_CLASS HandleScopeImplementer {
 };
 
 
-static const int kHandleBlockSize = v8::internal::KB - 2;  // fit in one page
+const int kHandleBlockSize = v8::internal::KB - 2;  // fit in one page
 
 
 void HandleScopeImplementer::SaveContext(Context* context) {

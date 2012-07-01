@@ -1,4 +1,4 @@
-// Copyright 2006-2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -41,6 +41,7 @@
 
 #include "v8.h"
 
+#include "platform-posix.h"
 #include "platform.h"
 #include "v8threads.h"
 #include "vm-state-inl.h"
@@ -61,7 +62,7 @@ double ceiling(double x) {
 static Mutex* limit_mutex = NULL;
 
 
-void OS::Setup() {
+void OS::SetUp() {
   // Seed the random number generator.
   // Convert the current time to a 64-bit integer first, before converting it
   // to an unsigned. Going directly can cause an overflow and the seed to be
@@ -72,6 +73,12 @@ void OS::Setup() {
   limit_mutex = CreateMutex();
 }
 
+
+void OS::PostSetUp() {
+  // Math functions depend on CPU features therefore they are initialized after
+  // CPU.
+  MathSetup();
+}
 
 uint64_t OS::CpuFeaturesImpliedByPlatform() {
   return 0;  // Nothing special about Cygwin.
@@ -114,7 +121,7 @@ double OS::LocalTimeOffset() {
 
 // We keep the lowest and highest addresses mapped as a quick way of
 // determining that pointers are outside the heap (used mostly in assertions
-// and verification).  The estimate is conservative, ie, not all addresses in
+// and verification).  The estimate is conservative, i.e., not all addresses in
 // 'allocated' space are actually allocated to our heap.  The range is
 // [lowest, highest), inclusive on the low and and exclusive on the high end.
 static void* lowest_ever_allocated = reinterpret_cast<void*>(-1);
@@ -166,21 +173,16 @@ void OS::Free(void* address, const size_t size) {
 }
 
 
-#ifdef ENABLE_HEAP_PROTECTION
-
-void OS::Protect(void* address, size_t size) {
-  // TODO(1240712): mprotect has a return value which is ignored here.
-  mprotect(address, size, PROT_READ);
+void OS::ProtectCode(void* address, const size_t size) {
+  DWORD old_protect;
+  VirtualProtect(address, size, PAGE_EXECUTE_READ, &old_protect);
 }
 
 
-void OS::Unprotect(void* address, size_t size, bool is_executable) {
-  // TODO(1240712): mprotect has a return value which is ignored here.
-  int prot = PROT_READ | PROT_WRITE | (is_executable ? PROT_EXEC : 0);
-  mprotect(address, size, prot);
+void OS::Guard(void* address, const size_t size) {
+  DWORD oldprotect;
+  VirtualProtect(address, size, PAGE_READONLY | PAGE_GUARD, &oldprotect);
 }
-
-#endif
 
 
 void OS::Sleep(int milliseconds) {
@@ -249,7 +251,6 @@ PosixMemoryMappedFile::~PosixMemoryMappedFile() {
 
 
 void OS::LogSharedLibraryAddresses() {
-#ifdef ENABLE_LOGGING_AND_PROFILING
   // This function assumes that the layout of the file is as follows:
   // hex_start_addr-hex_end_addr rwxp <unused data> [binary_file_name]
   // If we encounter an unexpected situation we abort scanning further entries.
@@ -296,7 +297,7 @@ void OS::LogSharedLibraryAddresses() {
       }
       LOG(isolate, SharedLibraryEvent(lib_name, start, end));
     } else {
-      // Entry not describing executable data. Skip to end of line to setup
+      // Entry not describing executable data. Skip to end of line to set up
       // reading the next entry.
       do {
         c = getc(fp);
@@ -306,7 +307,6 @@ void OS::LogSharedLibraryAddresses() {
   }
   free(lib_name);
   fclose(fp);
-#endif
 }
 
 
@@ -362,6 +362,17 @@ bool VirtualMemory::Uncommit(void* address, size_t size) {
 }
 
 
+bool VirtualMemory::Guard(void* address) {
+  if (NULL == VirtualAlloc(address,
+                           OS::CommitPageSize(),
+                           MEM_COMMIT,
+                           PAGE_READONLY | PAGE_GUARD)) {
+    return false;
+  }
+  return true;
+}
+
+
 class Thread::PlatformData : public Malloced {
  public:
   PlatformData() : thread_(kNoThread) {}
@@ -371,19 +382,10 @@ class Thread::PlatformData : public Malloced {
 
 
 
-Thread::Thread(Isolate* isolate, const Options& options)
-    : data_(new PlatformData),
-      isolate_(isolate),
-      stack_size_(options.stack_size) {
-  set_name(options.name);
-}
-
-
-Thread::Thread(Isolate* isolate, const char* name)
-    : data_(new PlatformData),
-      isolate_(isolate),
-      stack_size_(0) {
-  set_name(name);
+Thread::Thread(const Options& options)
+    : data_(new PlatformData()),
+      stack_size_(options.stack_size()) {
+  set_name(options.name());
 }
 
 
@@ -399,7 +401,6 @@ static void* ThreadEntry(void* arg) {
   // one) so we initialize it here too.
   thread->data()->thread_ = pthread_self();
   ASSERT(thread->data()->thread_ != kNoThread);
-  Thread::SetThreadLocal(Isolate::isolate_key(), thread->isolate());
   thread->Run();
   return NULL;
 }
@@ -484,7 +485,6 @@ void Thread::YieldCPU() {
 
 class CygwinMutex : public Mutex {
  public:
-
   CygwinMutex() {
     pthread_mutexattr_t attrs;
     memset(&attrs, 0, sizeof(attrs));
@@ -594,8 +594,6 @@ Semaphore* OS::CreateSemaphore(int count) {
 }
 
 
-#ifdef ENABLE_LOGGING_AND_PROFILING
-
 // ----------------------------------------------------------------------------
 // Cygwin profiler support.
 //
@@ -630,12 +628,14 @@ class Sampler::PlatformData : public Malloced {
 
 class SamplerThread : public Thread {
  public:
+  static const int kSamplerThreadStackSize = 64 * KB;
+
   explicit SamplerThread(int interval)
-      : Thread(NULL, "SamplerThread"),
+      : Thread(Thread::Options("SamplerThread", kSamplerThreadStackSize)),
         interval_(interval) {}
 
   static void AddActiveSampler(Sampler* sampler) {
-    ScopedLock lock(mutex_);
+    ScopedLock lock(mutex_.Pointer());
     SamplerRegistry::AddActiveSampler(sampler);
     if (instance_ == NULL) {
       instance_ = new SamplerThread(sampler->interval());
@@ -646,11 +646,10 @@ class SamplerThread : public Thread {
   }
 
   static void RemoveActiveSampler(Sampler* sampler) {
-    ScopedLock lock(mutex_);
+    ScopedLock lock(mutex_.Pointer());
     SamplerRegistry::RemoveActiveSampler(sampler);
     if (SamplerRegistry::GetState() == SamplerRegistry::HAS_NO_SAMPLERS) {
-      RuntimeProfiler::WakeUpRuntimeProfilerThreadBeforeShutdown();
-      instance_->Join();
+      RuntimeProfiler::StopRuntimeProfilerThreadBeforeShutdown(instance_);
       delete instance_;
       instance_ = NULL;
     }
@@ -733,14 +732,15 @@ class SamplerThread : public Thread {
   RuntimeProfilerRateLimiter rate_limiter_;
 
   // Protects the process wide state below.
-  static Mutex* mutex_;
+  static LazyMutex mutex_;
   static SamplerThread* instance_;
 
+ private:
   DISALLOW_COPY_AND_ASSIGN(SamplerThread);
 };
 
 
-Mutex* SamplerThread::mutex_ = OS::CreateMutex();
+LazyMutex SamplerThread::mutex_ = LAZY_MUTEX_INITIALIZER;
 SamplerThread* SamplerThread::instance_ = NULL;
 
 
@@ -773,7 +773,5 @@ void Sampler::Stop() {
   SetActive(false);
 }
 
-#endif  // ENABLE_LOGGING_AND_PROFILING
 
 } }  // namespace v8::internal
-

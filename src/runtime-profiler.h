@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -37,7 +37,6 @@ namespace internal {
 class Isolate;
 class JSFunction;
 class Object;
-class PendingListNode;
 class Semaphore;
 
 class RuntimeProfiler {
@@ -47,21 +46,29 @@ class RuntimeProfiler {
   static void GlobalSetup();
 
   static inline bool IsEnabled() {
-    ASSERT(has_been_globally_setup_);
+    ASSERT(has_been_globally_set_up_);
     return enabled_;
   }
 
   void OptimizeNow();
-  void OptimizeSoon(JSFunction* function);
 
   void NotifyTick();
 
-  void Setup();
+  void SetUp();
   void Reset();
   void TearDown();
 
   Object** SamplerWindowAddress();
   int SamplerWindowSize();
+
+  void NotifyICChanged() { any_ic_changed_ = true; }
+
+  void NotifyCodeGenerated(int generated_code_size) {
+    if (FLAG_watch_ic_patching) {
+      code_generated_ = true;
+      total_code_generated_ += generated_code_size;
+    }
+  }
 
   // Rate limiting support.
 
@@ -86,29 +93,22 @@ class RuntimeProfiler {
   static bool IsSomeIsolateInJS();
   static bool WaitForSomeIsolateToEnterJS();
 
-  // When shutting down we join the profiler thread. Doing so while
-  // it's waiting on a semaphore will cause a deadlock, so we have to
-  // wake it up first.
-  static void WakeUpRuntimeProfilerThreadBeforeShutdown();
+  // Stops the runtime profiler thread when profiling support is being
+  // turned off.
+  static void StopRuntimeProfilerThreadBeforeShutdown(Thread* thread);
 
   void UpdateSamplesAfterScavenge();
   void RemoveDeadSamples();
   void UpdateSamplesAfterCompact(ObjectVisitor* visitor);
 
+  void AttemptOnStackReplacement(JSFunction* function);
+
  private:
   static const int kSamplerWindowSize = 16;
-  static const int kStateWindowSize = 128;
-
-  enum SamplerState {
-    IN_NON_JS_STATE = 0,
-    IN_JS_STATE = 1
-  };
 
   static void HandleWakeUp(Isolate* isolate);
 
-  void Optimize(JSFunction* function, bool eager, int delay);
-
-  void AttemptOnStackReplacement(JSFunction* function);
+  void Optimize(JSFunction* function, const char* reason);
 
   void ClearSampleBuffer();
 
@@ -118,39 +118,27 @@ class RuntimeProfiler {
 
   void AddSample(JSFunction* function, int weight);
 
-#ifdef ENABLE_LOGGING_AND_PROFILING
-  void UpdateStateRatio(SamplerState current_state);
-#endif
-
   Isolate* isolate_;
 
   int sampler_threshold_;
   int sampler_threshold_size_factor_;
   int sampler_ticks_until_threshold_adjustment_;
 
-  // The ratio of ticks spent in JS code in percent.
-  Atomic32 js_ratio_;
-
   Object* sampler_window_[kSamplerWindowSize];
   int sampler_window_position_;
   int sampler_window_weight_[kSamplerWindowSize];
 
-  // Support for pending 'optimize soon' requests.
-  PendingListNode* optimize_soon_list_;
-
-  SamplerState state_window_[kStateWindowSize];
-  int state_window_position_;
-  int state_window_ticks_;
-  int state_counts_[2];
+  bool any_ic_changed_;
+  bool code_generated_;
+  int total_code_generated_;
 
   // Possible state values:
   //   -1            => the profiler thread is waiting on the semaphore
   //   0 or positive => the number of isolates running JavaScript code.
   static Atomic32 state_;
-  static Semaphore* semaphore_;
 
 #ifdef DEBUG
-  static bool has_been_globally_setup_;
+  static bool has_been_globally_set_up_;
 #endif
   static bool enabled_;
 };
@@ -159,7 +147,7 @@ class RuntimeProfiler {
 // Rate limiter intended to be used in the profiler thread.
 class RuntimeProfilerRateLimiter BASE_EMBEDDED {
  public:
-  RuntimeProfilerRateLimiter() : non_js_ticks_(0) { }
+  RuntimeProfilerRateLimiter() {}
 
   // Suspends the current thread (which must be the profiler thread)
   // when not executing JavaScript to minimize CPU usage. Returns
@@ -170,8 +158,6 @@ class RuntimeProfilerRateLimiter BASE_EMBEDDED {
   bool SuspendIfNecessary();
 
  private:
-  int non_js_ticks_;
-
   DISALLOW_COPY_AND_ASSIGN(RuntimeProfilerRateLimiter);
 };
 

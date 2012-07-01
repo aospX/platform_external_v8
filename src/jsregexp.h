@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,15 +28,18 @@
 #ifndef V8_JSREGEXP_H_
 #define V8_JSREGEXP_H_
 
-#include "macro-assembler.h"
+#include "allocation.h"
+#include "assembler.h"
 #include "zone-inl.h"
 
 namespace v8 {
 namespace internal {
 
-
+class NodeVisitor;
+class RegExpCompiler;
 class RegExpMacroAssembler;
-
+class RegExpNode;
+class RegExpTree;
 
 class RegExpImpl {
  public:
@@ -255,6 +258,7 @@ class SetRelation BASE_EMBEDDED {
     return (bits_ == (kInFirst | kInSecond | kInBoth));
   }
   int value() { return bits_; }
+
  private:
   int bits_;
 };
@@ -387,7 +391,7 @@ class DispatchTable : public ZoneObject {
     typedef uc16 Key;
     typedef Entry Value;
     static const uc16 kNoKey;
-    static const Entry kNoValue;
+    static const Entry NoValue() { return Value(); }
     static inline int Compare(uc16 a, uc16 b) {
       if (a == b)
         return 0;
@@ -404,6 +408,7 @@ class DispatchTable : public ZoneObject {
 
   template <typename Callback>
   void ForEach(Callback* callback) { return tree()->ForEach(callback); }
+
  private:
   // There can't be a static empty set since it allocates its
   // successors in a zone and caches them.
@@ -631,7 +636,7 @@ class RegExpNode: public ZoneObject {
   static const int kNodeIsTooComplexForGreedyLoops = -1;
   virtual int GreedyLoopTextLength() { return kNodeIsTooComplexForGreedyLoops; }
   Label* label() { return &label_; }
-  // If non-generic code is generated for a node (ie the node is not at the
+  // If non-generic code is generated for a node (i.e. the node is not at the
   // start of the trace) then it cannot be reused.  This variable sets a limit
   // on how often we allow that to happen before we insist on starting a new
   // trace and generating generic code for a node that can be reused by flushing
@@ -793,6 +798,7 @@ class ActionNode: public SeqRegExpNode {
   virtual int GreedyLoopTextLength() { return kNodeIsTooComplexForGreedyLoops; }
   virtual ActionNode* Clone() { return new ActionNode(*this); }
   virtual int ComputeFirstCharacterSet(int budget);
+
  private:
   union {
     struct {
@@ -861,6 +867,7 @@ class TextNode: public SeqRegExpNode {
   }
   void CalculateOffsets();
   virtual int ComputeFirstCharacterSet(int budget);
+
  private:
   enum TextEmitPassType {
     NON_ASCII_MATCH,             // Check for characters that can't match.
@@ -925,6 +932,7 @@ class AssertionNode: public SeqRegExpNode {
   virtual AssertionNode* Clone() { return new AssertionNode(*this); }
   AssertionNodeType type() { return type_; }
   void set_type(AssertionNodeType type) { type_ = type; }
+
  private:
   AssertionNode(AssertionNodeType t, RegExpNode* on_success)
       : SeqRegExpNode(on_success), type_(t) { }
@@ -955,6 +963,7 @@ class BackReferenceNode: public SeqRegExpNode {
   }
   virtual BackReferenceNode* Clone() { return new BackReferenceNode(*this); }
   virtual int ComputeFirstCharacterSet(int budget);
+
  private:
   int start_reg_;
   int end_reg_;
@@ -1071,7 +1080,7 @@ class ChoiceNode: public RegExpNode {
   virtual bool try_to_emit_quick_check_for_alternative(int i) { return true; }
 
  protected:
-  int GreedyLoopTextLength(GuardedAlternative* alternative);
+  int GreedyLoopTextLengthForAlternative(GuardedAlternative* alternative);
   ZoneList<GuardedAlternative>* alternatives_;
 
  private:
@@ -1301,6 +1310,7 @@ class Trace {
   }
   void InvalidateCurrentCharacter();
   void AdvanceCurrentPositionInTrace(int by, RegExpCompiler* compiler);
+
  private:
   int FindAffectedRegisters(OutSet* affected_registers);
   void PerformDeferredActions(RegExpMacroAssembler* macro,
@@ -1402,6 +1412,7 @@ FOR_EACH_NODE_TYPE(DECLARE_VISIT)
   void fail(const char* error_message) {
     error_message_ = error_message;
   }
+
  private:
   bool ignore_case_;
   bool is_ascii_;
@@ -1455,12 +1466,12 @@ class RegExpEngine: public AllStatic {
 
 class OffsetsVector {
  public:
-  explicit inline OffsetsVector(int num_registers)
+  inline OffsetsVector(int num_registers, Isolate* isolate)
       : offsets_vector_length_(num_registers) {
     if (offsets_vector_length_ > Isolate::kJSRegexpStaticOffsetsVectorSize) {
       vector_ = NewArray<int>(offsets_vector_length_);
     } else {
-      vector_ = Isolate::Current()->jsregexp_static_offsets_vector();
+      vector_ = isolate->jsregexp_static_offsets_vector();
     }
   }
   inline ~OffsetsVector() {

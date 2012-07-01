@@ -54,7 +54,7 @@ function Revive(holder, name, reviver) {
 
 function JSONParse(text, reviver) {
   var unfiltered = %ParseJson(TO_STRING_INLINE(text));
-  if (IS_FUNCTION(reviver)) {
+  if (IS_SPEC_FUNCTION(reviver)) {
     return Revive({'': unfiltered}, '', reviver);
   } else {
     return unfiltered;
@@ -143,17 +143,17 @@ function JSONSerialize(key, holder, replacer, stack, indent, gap) {
   var value = holder[key];
   if (IS_SPEC_OBJECT(value)) {
     var toJSON = value.toJSON;
-    if (IS_FUNCTION(toJSON)) {
+    if (IS_SPEC_FUNCTION(toJSON)) {
       value = %_CallFunction(value, key, toJSON);
     }
   }
-  if (IS_FUNCTION(replacer)) {
+  if (IS_SPEC_FUNCTION(replacer)) {
     value = %_CallFunction(holder, key, value, replacer);
   }
   if (IS_STRING(value)) {
     return %QuoteJSONString(value);
   } else if (IS_NUMBER(value)) {
-    return NUMBER_IS_FINITE(value) ? $String(value) : "null";
+    return JSON_NUMBER_TO_STRING(value);
   } else if (IS_BOOLEAN(value)) {
     return value ? "true" : "false";
   } else if (IS_NULL(value)) {
@@ -164,7 +164,7 @@ function JSONSerialize(key, holder, replacer, stack, indent, gap) {
       return SerializeArray(value, replacer, stack, indent, gap);
     } else if (IS_NUMBER_WRAPPER(value)) {
       value = ToNumber(value);
-      return NUMBER_IS_FINITE(value) ? ToString(value) : "null";
+      return JSON_NUMBER_TO_STRING(value);
     } else if (IS_STRING_WRAPPER(value)) {
       return %QuoteJSONString(ToString(value));
     } else if (IS_BOOLEAN_WRAPPER(value)) {
@@ -191,31 +191,37 @@ function BasicSerializeArray(value, stack, builder) {
   var val = value[0];
   if (IS_STRING(val)) {
     // First entry is a string. Remaining entries are likely to be strings too.
-    builder.push(%QuoteJSONString(val));
-    for (var i = 1; i < len; i++) {
-      val = value[i];
-      if (IS_STRING(val)) {
-        builder.push(%QuoteJSONStringComma(val));
-      } else {
-        builder.push(",");
-        var before = builder.length;
-        BasicJSONSerialize(i, value[i], stack, builder);
-        if (before == builder.length) builder[before - 1] = ",null";
+    var array_string = %QuoteJSONStringArray(value);
+    if (!IS_UNDEFINED(array_string)) {
+      // array_string also includes bracket characters so we are done.
+      builder[builder.length - 1] = array_string;
+      stack.pop();
+      return;
+    } else {
+      builder.push(%QuoteJSONString(val));
+      for (var i = 1; i < len; i++) {
+        val = value[i];
+        if (IS_STRING(val)) {
+          builder.push(%QuoteJSONStringComma(val));
+        } else {
+          builder.push(",");
+          var before = builder.length;
+          BasicJSONSerialize(i, val, stack, builder);
+          if (before == builder.length) builder[before - 1] = ",null";
+        }
       }
     }
   } else if (IS_NUMBER(val)) {
     // First entry is a number. Remaining entries are likely to be numbers too.
-    builder.push(NUMBER_IS_FINITE(val) ? %_NumberToString(val) : "null");
+    builder.push(JSON_NUMBER_TO_STRING(val));
     for (var i = 1; i < len; i++) {
       builder.push(",");
       val = value[i];
       if (IS_NUMBER(val)) {
-        builder.push(NUMBER_IS_FINITE(val) 
-                     ? %_NumberToString(val) 
-                     : "null");
+        builder.push(JSON_NUMBER_TO_STRING(val));
       } else {
         var before = builder.length;
-        BasicJSONSerialize(i, value[i], stack, builder);
+        BasicJSONSerialize(i, val, stack, builder);
         if (before == builder.length) builder[before - 1] = ",null";
       }
     }
@@ -226,13 +232,12 @@ function BasicSerializeArray(value, stack, builder) {
     for (var i = 1; i < len; i++) {
       builder.push(",");
       before = builder.length;
-      val = value[i];
-      BasicJSONSerialize(i, val, stack, builder);
+      BasicJSONSerialize(i, value[i], stack, builder);
       if (before == builder.length) builder[before - 1] = ",null";
     }
   }
   stack.pop();
-  builder.push("]"); 
+  builder.push("]");
 }
 
 
@@ -268,14 +273,14 @@ function BasicSerializeObject(value, stack, builder) {
 function BasicJSONSerialize(key, value, stack, builder) {
   if (IS_SPEC_OBJECT(value)) {
     var toJSON = value.toJSON;
-    if (IS_FUNCTION(toJSON)) {
+    if (IS_SPEC_FUNCTION(toJSON)) {
       value = %_CallFunction(value, ToString(key), toJSON);
     }
   }
   if (IS_STRING(value)) {
-    builder.push(%QuoteJSONString(value));
+    builder.push(value !== "" ? %QuoteJSONString(value) : '""');
   } else if (IS_NUMBER(value)) {
-    builder.push(NUMBER_IS_FINITE(value) ? %_NumberToString(value) : "null");
+    builder.push(JSON_NUMBER_TO_STRING(value));
   } else if (IS_BOOLEAN(value)) {
     builder.push(value ? "true" : "false");
   } else if (IS_NULL(value)) {
@@ -285,7 +290,7 @@ function BasicJSONSerialize(key, value, stack, builder) {
     // Unwrap value if necessary
     if (IS_NUMBER_WRAPPER(value)) {
       value = ToNumber(value);
-      builder.push(NUMBER_IS_FINITE(value) ? %_NumberToString(value) : "null");
+      builder.push(JSON_NUMBER_TO_STRING(value));
     } else if (IS_STRING_WRAPPER(value)) {
       builder.push(%QuoteJSONString(ToString(value)));
     } else if (IS_BOOLEAN_WRAPPER(value)) {
@@ -332,11 +337,12 @@ function JSONStringify(value, replacer, space) {
   return JSONSerialize('', {'': value}, replacer, new InternalArray(), "", gap);
 }
 
-function SetupJSON() {
+function SetUpJSON() {
+  %CheckIsBootstrapping();
   InstallFunctions($JSON, DONT_ENUM, $Array(
     "parse", JSONParse,
     "stringify", JSONStringify
   ));
 }
 
-SetupJSON();
+SetUpJSON();

@@ -22,6 +22,7 @@ V8_LOCAL_SRC_FILES := \
 	src/counters.cc \
 	src/cpu-profiler.cc \
 	src/data-flow.cc \
+	src/date.cc \
 	src/dateparser.cc \
 	src/debug.cc \
 	src/debug-agent.cc \
@@ -29,6 +30,7 @@ V8_LOCAL_SRC_FILES := \
 	src/disassembler.cc \
 	src/diy-fp.cc \
 	src/dtoa.cc \
+	src/elements.cc \
 	src/execution.cc \
 	src/extensions/externalize-string-extension.cc \
 	src/extensions/gc-extension.cc \
@@ -36,18 +38,18 @@ V8_LOCAL_SRC_FILES := \
 	src/fast-dtoa.cc \
 	src/fixed-dtoa.cc \
 	src/flags.cc \
-	src/frame-element.cc \
 	src/frames.cc \
 	src/full-codegen.cc \
 	src/func-name-inferrer.cc \
 	src/global-handles.cc \
 	src/handles.cc \
-	src/hashmap.cc \
 	src/heap.cc \
 	src/heap-profiler.cc \
 	src/hydrogen.cc \
 	src/hydrogen-instructions.cc \
 	src/ic.cc \
+	src/incremental-marking.cc \
+	src/interface.cc \
 	src/interpreter-irregexp.cc \
 	src/isolate.cc \
 	src/jsregexp.cc \
@@ -60,6 +62,7 @@ V8_LOCAL_SRC_FILES := \
 	src/messages.cc \
 	src/objects.cc \
 	src/objects-visiting.cc \
+	src/once.cc \
 	src/parser.cc \
 	src/preparse-data.cc \
 	src/preparser.cc \
@@ -73,23 +76,25 @@ V8_LOCAL_SRC_FILES := \
 	src/runtime-profiler.cc \
 	src/safepoint-table.cc \
 	src/scanner.cc \
-	src/scanner-base.cc \
+	src/scanner-character-streams.cc \
 	src/scopeinfo.cc \
 	src/scopes.cc \
 	src/serialize.cc \
 	src/snapshot-common.cc \
 	src/spaces.cc \
+	src/store-buffer.cc \
 	src/string-search.cc \
 	src/string-stream.cc \
 	src/strtod.cc \
 	src/stub-cache.cc \
 	src/token.cc \
-	src/top.cc \
 	src/type-info.cc \
 	src/unicode.cc \
 	src/utils.cc \
 	src/v8-counters.cc \
 	src/v8.cc \
+	src/v8conversions.cc \
+	src/v8utils.cc \
 	src/v8threads.cc \
 	src/variables.cc \
 	src/version.cc \
@@ -119,7 +124,6 @@ endif
 
 ifeq ($(TARGET_ARCH),x86)
   V8_LOCAL_SRC_FILES += \
-		src/atomicops_internals_x86_gcc.cc \
 		src/ia32/assembler-ia32.cc \
 		src/ia32/builtins-ia32.cc \
 		src/ia32/codegen-ia32.cc \
@@ -158,7 +162,7 @@ V8_LOCAL_JS_LIBRARY_FILES := \
 	src/uri.js \
 	src/math.js \
 	src/messages.js \
-	src/apinatives.js
+	src/apinatives.js 
 
 # These JS library sources must follow the above sources but their order is not
 # important.
@@ -172,3 +176,8 @@ V8_LOCAL_JS_LIBRARY_FILES += \
 
 V8_LOCAL_JS_LIBRARY_FILES += \
 	src/macros.py
+
+V8_LOCAL_JS_EXPERIMENTAL_LIBRARY_FILES := \
+	src/collection.js \
+	src/proxy.js
+

@@ -55,9 +55,38 @@ double modulo(double x, double y) {
 }
 
 
+double fast_sin(double x) {
+  UNIMPLEMENTED();
+  return 0;
+}
+
+
+double fast_cos(double x) {
+  UNIMPLEMENTED();
+  return 0;
+}
+
+
+double fast_tan(double x) {
+  UNIMPLEMENTED();
+  return 0;
+}
+
+
+double fast_log(double x) {
+  UNIMPLEMENTED();
+  return 0;
+}
+
+
 // Initialize OS class early in the V8 startup.
-void OS::Setup() {
+void OS::SetUp() {
   // Seed the random number generator.
+  UNIMPLEMENTED();
+}
+
+
+void OS::PostSetUp() {
   UNIMPLEMENTED();
 }
 
@@ -186,6 +215,11 @@ bool OS::ArmCpuHasFeature(CpuFeature feature) {
 }
 
 
+bool OS::ArmUsingHardFloat() {
+  UNIMPLEMENTED();
+}
+
+
 bool OS::IsOutsideAllocatedSpace(void* address) {
   UNIMPLEMENTED();
   return false;
@@ -212,18 +246,9 @@ void OS::Free(void* buf, const size_t length) {
 }
 
 
-#ifdef ENABLE_HEAP_PROTECTION
-
-void OS::Protect(void* address, size_t size) {
+void OS::Guard(void* address, const size_t size) {
   UNIMPLEMENTED();
 }
-
-
-void OS::Unprotect(void* address, size_t size, bool is_executable) {
-  UNIMPLEMENTED();
-}
-
-#endif
 
 
 void OS::Sleep(int milliseconds) {
@@ -299,6 +324,12 @@ bool VirtualMemory::Uncommit(void* address, size_t size) {
 }
 
 
+bool VirtualMemory::Guard(void* address) {
+  UNIMPLEMENTED();
+  return false;
+}
+
+
 class Thread::PlatformData : public Malloced {
  public:
   PlatformData() {
@@ -309,18 +340,16 @@ class Thread::PlatformData : public Malloced {
 };
 
 
-Thread::Thread(Isolate* isolate, const Options& options)
+Thread::Thread(const Options& options)
     : data_(new PlatformData()),
-      isolate_(isolate),
       stack_size_(options.stack_size) {
   set_name(options.name);
   UNIMPLEMENTED();
 }
 
 
-Thread::Thread(Isolate* isolate, const char* name)
+Thread::Thread(const char* name)
     : data_(new PlatformData()),
-      isolate_(isolate),
       stack_size_(0) {
   set_name(name);
   UNIMPLEMENTED();
@@ -434,7 +463,6 @@ Semaphore* OS::CreateSemaphore(int count) {
   return new NullSemaphore(count);
 }
 
-#ifdef ENABLE_LOGGING_AND_PROFILING
 
 class ProfileSampler::PlatformData  : public Malloced {
  public:
@@ -469,6 +497,5 @@ void ProfileSampler::Stop() {
   UNIMPLEMENTED();
 }
 
-#endif  // ENABLE_LOGGING_AND_PROFILING
 
 } }  // namespace v8::internal

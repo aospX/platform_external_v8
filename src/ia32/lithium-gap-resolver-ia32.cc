@@ -303,18 +303,36 @@ void LGapResolver::EmitMove(int index) {
     }
 
   } else if (source->IsConstantOperand()) {
-    ASSERT(destination->IsRegister() || destination->IsStackSlot());
-    Immediate src = cgen_->ToImmediate(source);
-    Operand dst = cgen_->ToOperand(destination);
-    __ mov(dst, src);
+    LConstantOperand* constant_source = LConstantOperand::cast(source);
+    if (destination->IsRegister()) {
+      Register dst = cgen_->ToRegister(destination);
+      if (cgen_->IsInteger32(constant_source)) {
+        __ Set(dst, cgen_->ToInteger32Immediate(constant_source));
+      } else {
+        __ LoadObject(dst, cgen_->ToHandle(constant_source));
+      }
+    } else {
+      ASSERT(destination->IsStackSlot());
+      Operand dst = cgen_->ToOperand(destination);
+      if (cgen_->IsInteger32(constant_source)) {
+        __ Set(dst, cgen_->ToInteger32Immediate(constant_source));
+      } else {
+        Register tmp = EnsureTempRegister();
+        __ LoadObject(tmp, cgen_->ToHandle(constant_source));
+        __ mov(dst, tmp);
+      }
+    }
 
   } else if (source->IsDoubleRegister()) {
-    ASSERT(destination->IsDoubleRegister() ||
-           destination->IsDoubleStackSlot());
     XMMRegister src = cgen_->ToDoubleRegister(source);
-    Operand dst = cgen_->ToOperand(destination);
-    __ movdbl(dst, src);
-
+    if (destination->IsDoubleRegister()) {
+      XMMRegister dst = cgen_->ToDoubleRegister(destination);
+      __ movaps(dst, src);
+    } else {
+      ASSERT(destination->IsDoubleStackSlot());
+      Operand dst = cgen_->ToOperand(destination);
+      __ movdbl(dst, src);
+    }
   } else if (source->IsDoubleStackSlot()) {
     ASSERT(destination->IsDoubleRegister() ||
            destination->IsDoubleStackSlot());
@@ -391,13 +409,19 @@ void LGapResolver::EmitSwap(int index) {
       __ mov(dst, tmp1);
       __ mov(src, tmp0);
     }
+  } else if (source->IsDoubleRegister() && destination->IsDoubleRegister()) {
+    // XMM register-register swap. We rely on having xmm0
+    // available as a fixed scratch register.
+    XMMRegister src = cgen_->ToDoubleRegister(source);
+    XMMRegister dst = cgen_->ToDoubleRegister(destination);
+    __ movaps(xmm0, src);
+    __ movaps(src, dst);
+    __ movaps(dst, xmm0);
 
   } else if (source->IsDoubleRegister() || destination->IsDoubleRegister()) {
-    // XMM register-register or register-memory.  We rely on having xmm0
+    // XMM register-memory swap.  We rely on having xmm0
     // available as a fixed scratch register.
-    ASSERT(source->IsDoubleRegister() || source->IsDoubleStackSlot());
-    ASSERT(destination->IsDoubleRegister() ||
-           destination->IsDoubleStackSlot());
+    ASSERT(source->IsDoubleStackSlot() || destination->IsDoubleStackSlot());
     XMMRegister reg = cgen_->ToDoubleRegister(source->IsDoubleRegister()
                                                   ? source
                                                   : destination);

@@ -53,7 +53,7 @@ namespace internal {
 // code.
 class ArmDebugger {
  public:
-  explicit ArmDebugger(Simulator* sim);
+  explicit ArmDebugger(Simulator* sim) : sim_(sim) { }
   ~ArmDebugger();
 
   void Stop(Instruction* instr);
@@ -82,11 +82,6 @@ class ArmDebugger {
   void UndoBreakpoints();
   void RedoBreakpoints();
 };
-
-
-ArmDebugger::ArmDebugger(Simulator* sim) {
-  sim_ = sim;
-}
 
 
 ArmDebugger::~ArmDebugger() {
@@ -296,6 +291,13 @@ void ArmDebugger::Debug() {
     if (line == NULL) {
       break;
     } else {
+      char* last_input = sim_->last_debugger_input();
+      if (strcmp(line, "\n") == 0 && last_input != NULL) {
+        line = last_input;
+      } else {
+        // Ownership is transferred to sim_;
+        sim_->set_last_debugger_input(line);
+      }
       // Use sscanf to parse the individual parts of the command line. At the
       // moment no command expects more than two parameters.
       int argc = SScanF(line,
@@ -611,7 +613,6 @@ void ArmDebugger::Debug() {
         PrintF("Unknown command: %s\n", cmd);
       }
     }
-    DeleteArray(line);
   }
 
   // Add all the breakpoints back to stop execution and enter the debugger
@@ -642,6 +643,12 @@ static bool AllOnOnePage(uintptr_t start, int size) {
   intptr_t start_page = (start & ~CachePage::kPageMask);
   intptr_t end_page = ((start + size) & ~CachePage::kPageMask);
   return start_page == end_page;
+}
+
+
+void Simulator::set_last_debugger_input(char* input) {
+  DeleteArray(last_debugger_input_);
+  last_debugger_input_ = input;
 }
 
 
@@ -719,21 +726,22 @@ void Simulator::CheckICache(v8::internal::HashMap* i_cache,
 }
 
 
-void Simulator::Initialize() {
-  if (Isolate::Current()->simulator_initialized()) return;
-  Isolate::Current()->set_simulator_initialized(true);
-  ::v8::internal::ExternalReference::set_redirector(&RedirectExternalReference);
+void Simulator::Initialize(Isolate* isolate) {
+  if (isolate->simulator_initialized()) return;
+  isolate->set_simulator_initialized(true);
+  ::v8::internal::ExternalReference::set_redirector(isolate,
+                                                    &RedirectExternalReference);
 }
 
 
-Simulator::Simulator() : isolate_(Isolate::Current()) {
+Simulator::Simulator(Isolate* isolate) : isolate_(isolate) {
   i_cache_ = isolate_->simulator_i_cache();
   if (i_cache_ == NULL) {
     i_cache_ = new v8::internal::HashMap(&ICacheMatch);
     isolate_->set_simulator_i_cache(i_cache_);
   }
-  Initialize();
-  // Setup simulator support first. Some of this information is needed to
+  Initialize(isolate);
+  // Set up simulator support first. Some of this information is needed to
   // setup the architecture state.
   size_t stack_size = 1 * 1024*1024;  // allocate 1MB for stack
   stack_ = reinterpret_cast<char*>(malloc(stack_size));
@@ -742,7 +750,7 @@ Simulator::Simulator() : isolate_(Isolate::Current()) {
   break_pc_ = NULL;
   break_instr_ = 0;
 
-  // Setup architecture state.
+  // Set up architecture state.
   // All registers are initialized to zero to start with.
   for (int i = 0; i < num_registers; i++) {
     registers_[i] = 0;
@@ -780,6 +788,8 @@ Simulator::Simulator() : isolate_(Isolate::Current()) {
   registers_[pc] = bad_lr;
   registers_[lr] = bad_lr;
   InitializeCoverage();
+
+  last_debugger_input_ = NULL;
 }
 
 
@@ -848,17 +858,13 @@ void* Simulator::RedirectExternalReference(void* external_function,
 // Get the active Simulator for the current thread.
 Simulator* Simulator::current(Isolate* isolate) {
   v8::internal::Isolate::PerIsolateThreadData* isolate_data =
-      Isolate::CurrentPerIsolateThreadData();
-  if (isolate_data == NULL) {
-    Isolate::EnterDefaultIsolate();
-    isolate_data = Isolate::CurrentPerIsolateThreadData();
-  }
+      isolate->FindOrAllocatePerThreadDataForThisThread();
   ASSERT(isolate_data != NULL);
 
   Simulator* sim = isolate_data->simulator();
   if (sim == NULL) {
     // TODO(146): delete the simulator object when a thread/isolate goes away.
-    sim = new Simulator();
+    sim = new Simulator(isolate);
     isolate_data->set_simulator(sim);
   }
   return sim;
@@ -1009,26 +1015,74 @@ double Simulator::get_double_from_d_register(int dreg) {
 }
 
 
-// For use in calls that take two double values, constructed from r0, r1, r2
-// and r3.
+// For use in calls that take two double values, constructed either
+// from r0-r3 or d0 and d1.
 void Simulator::GetFpArgs(double* x, double* y) {
-  // We use a char buffer to get around the strict-aliasing rules which
-  // otherwise allow the compiler to optimize away the copy.
-  char buffer[2 * sizeof(registers_[0])];
-  // Registers 0 and 1 -> x.
-  memcpy(buffer, registers_, sizeof(buffer));
-  memcpy(x, buffer, sizeof(buffer));
-  // Registers 2 and 3 -> y.
-  memcpy(buffer, registers_ + 2, sizeof(buffer));
-  memcpy(y, buffer, sizeof(buffer));
+  if (use_eabi_hardfloat()) {
+    *x = vfp_register[0];
+    *y = vfp_register[1];
+  } else {
+    // We use a char buffer to get around the strict-aliasing rules which
+    // otherwise allow the compiler to optimize away the copy.
+    char buffer[sizeof(*x)];
+    // Registers 0 and 1 -> x.
+    memcpy(buffer, registers_, sizeof(*x));
+    memcpy(x, buffer, sizeof(*x));
+    // Registers 2 and 3 -> y.
+    memcpy(buffer, registers_ + 2, sizeof(*y));
+    memcpy(y, buffer, sizeof(*y));
+  }
+}
+
+// For use in calls that take one double value, constructed either
+// from r0 and r1 or d0.
+void Simulator::GetFpArgs(double* x) {
+  if (use_eabi_hardfloat()) {
+    *x = vfp_register[0];
+  } else {
+    // We use a char buffer to get around the strict-aliasing rules which
+    // otherwise allow the compiler to optimize away the copy.
+    char buffer[sizeof(*x)];
+    // Registers 0 and 1 -> x.
+    memcpy(buffer, registers_, sizeof(*x));
+    memcpy(x, buffer, sizeof(*x));
+  }
 }
 
 
+// For use in calls that take one double value constructed either
+// from r0 and r1 or d0 and one integer value.
+void Simulator::GetFpArgs(double* x, int32_t* y) {
+  if (use_eabi_hardfloat()) {
+    *x = vfp_register[0];
+    *y = registers_[1];
+  } else {
+    // We use a char buffer to get around the strict-aliasing rules which
+    // otherwise allow the compiler to optimize away the copy.
+    char buffer[sizeof(*x)];
+    // Registers 0 and 1 -> x.
+    memcpy(buffer, registers_, sizeof(*x));
+    memcpy(x, buffer, sizeof(*x));
+    // Register 2 -> y.
+    memcpy(buffer, registers_ + 2, sizeof(*y));
+    memcpy(y, buffer, sizeof(*y));
+  }
+}
+
+
+// The return value is either in r0/r1 or d0.
 void Simulator::SetFpResult(const double& result) {
-  char buffer[2 * sizeof(registers_[0])];
-  memcpy(buffer, &result, sizeof(buffer));
-  // result -> registers 0 and 1.
-  memcpy(registers_, buffer, sizeof(buffer));
+  if (use_eabi_hardfloat()) {
+    char buffer[2 * sizeof(vfp_register[0])];
+    memcpy(buffer, &result, sizeof(buffer));
+    // Copy result to d0.
+    memcpy(vfp_register, buffer, sizeof(buffer));
+  } else {
+    char buffer[2 * sizeof(registers_[0])];
+    memcpy(buffer, &result, sizeof(buffer));
+    // Copy result to r0 and r1.
+    memcpy(registers_, buffer, sizeof(buffer));
+  }
 }
 
 
@@ -1223,9 +1277,9 @@ void Simulator::WriteDW(int32_t addr, int32_t value1, int32_t value2) {
 
 // Returns the limit of the stack area to enable checking for stack overflows.
 uintptr_t Simulator::StackLimit() const {
-  // Leave a safety margin of 256 bytes to prevent overrunning the stack when
+  // Leave a safety margin of 1024 bytes to prevent overrunning the stack when
   // pushing values.
-  return reinterpret_cast<uintptr_t>(stack_) + 256;
+  return reinterpret_cast<uintptr_t>(stack_) + 1024;
 }
 
 
@@ -1282,12 +1336,13 @@ void Simulator::SetVFlag(bool val) {
 
 
 // Calculate C flag value for additions.
-bool Simulator::CarryFrom(int32_t left, int32_t right) {
+bool Simulator::CarryFrom(int32_t left, int32_t right, int32_t carry) {
   uint32_t uleft = static_cast<uint32_t>(left);
   uint32_t uright = static_cast<uint32_t>(right);
   uint32_t urest  = 0xffffffffU - uleft;
 
-  return (uright > urest);
+  return (uright > urest) ||
+         (carry && (((uright + 1) > urest) || (uright > (urest - 1))));
 }
 
 
@@ -1572,6 +1627,8 @@ void Simulator::HandleRList(Instruction* instr, bool load) {
   ProcessPUW(instr, num_regs, kPointerSize, &start_address, &end_address);
 
   intptr_t* address = reinterpret_cast<intptr_t*>(start_address);
+  // Catch null pointers a little earlier.
+  ASSERT(start_address > 8191 || start_address < 0);
   int reg = 0;
   while (rlist != 0) {
     if ((rlist & 1) != 0) {
@@ -1684,27 +1741,92 @@ void Simulator::SoftwareInterrupt(Instruction* instr) {
       int32_t* stack_pointer = reinterpret_cast<int32_t*>(get_register(sp));
       int32_t arg4 = stack_pointer[0];
       int32_t arg5 = stack_pointer[1];
+      bool fp_call =
+         (redirection->type() == ExternalReference::BUILTIN_FP_FP_CALL) ||
+         (redirection->type() == ExternalReference::BUILTIN_COMPARE_CALL) ||
+         (redirection->type() == ExternalReference::BUILTIN_FP_CALL) ||
+         (redirection->type() == ExternalReference::BUILTIN_FP_INT_CALL);
+      if (use_eabi_hardfloat()) {
+        // With the hard floating point calling convention, double
+        // arguments are passed in VFP registers. Fetch the arguments
+        // from there and call the builtin using soft floating point
+        // convention.
+        switch (redirection->type()) {
+        case ExternalReference::BUILTIN_FP_FP_CALL:
+        case ExternalReference::BUILTIN_COMPARE_CALL:
+          arg0 = vfp_register[0];
+          arg1 = vfp_register[1];
+          arg2 = vfp_register[2];
+          arg3 = vfp_register[3];
+          break;
+        case ExternalReference::BUILTIN_FP_CALL:
+          arg0 = vfp_register[0];
+          arg1 = vfp_register[1];
+          break;
+        case ExternalReference::BUILTIN_FP_INT_CALL:
+          arg0 = vfp_register[0];
+          arg1 = vfp_register[1];
+          arg2 = get_register(0);
+          break;
+        default:
+          break;
+        }
+      }
       // This is dodgy but it works because the C entry stubs are never moved.
       // See comment in codegen-arm.cc and bug 1242173.
       int32_t saved_lr = get_register(lr);
       intptr_t external =
           reinterpret_cast<intptr_t>(redirection->external_function());
-      if (redirection->type() == ExternalReference::FP_RETURN_CALL) {
-        SimulatorRuntimeFPCall target =
-            reinterpret_cast<SimulatorRuntimeFPCall>(external);
+      if (fp_call) {
         if (::v8::internal::FLAG_trace_sim || !stack_aligned) {
-          double x, y;
-          GetFpArgs(&x, &y);
-          PrintF("Call to host function at %p with args %f, %f",
-                 FUNCTION_ADDR(target), x, y);
+          SimulatorRuntimeFPCall target =
+              reinterpret_cast<SimulatorRuntimeFPCall>(external);
+          double dval0, dval1;
+          int32_t ival;
+          switch (redirection->type()) {
+          case ExternalReference::BUILTIN_FP_FP_CALL:
+          case ExternalReference::BUILTIN_COMPARE_CALL:
+            GetFpArgs(&dval0, &dval1);
+            PrintF("Call to host function at %p with args %f, %f",
+                FUNCTION_ADDR(target), dval0, dval1);
+            break;
+          case ExternalReference::BUILTIN_FP_CALL:
+            GetFpArgs(&dval0);
+            PrintF("Call to host function at %p with arg %f",
+                FUNCTION_ADDR(target), dval0);
+            break;
+          case ExternalReference::BUILTIN_FP_INT_CALL:
+            GetFpArgs(&dval0, &ival);
+            PrintF("Call to host function at %p with args %f, %d",
+                FUNCTION_ADDR(target), dval0, ival);
+            break;
+          default:
+            UNREACHABLE();
+            break;
+          }
           if (!stack_aligned) {
             PrintF(" with unaligned stack %08x\n", get_register(sp));
           }
           PrintF("\n");
         }
         CHECK(stack_aligned);
-        double result = target(arg0, arg1, arg2, arg3);
-        SetFpResult(result);
+        if (redirection->type() != ExternalReference::BUILTIN_COMPARE_CALL) {
+          SimulatorRuntimeFPCall target =
+              reinterpret_cast<SimulatorRuntimeFPCall>(external);
+          double result = target(arg0, arg1, arg2, arg3);
+          SetFpResult(result);
+        } else {
+          SimulatorRuntimeCall target =
+              reinterpret_cast<SimulatorRuntimeCall>(external);
+          int64_t result = target(arg0, arg1, arg2, arg3, arg4, arg5);
+          int32_t lo_res = static_cast<int32_t>(result);
+          int32_t hi_res = static_cast<int32_t>(result >> 32);
+          if (::v8::internal::FLAG_trace_sim) {
+            PrintF("Returned %08x\n", lo_res);
+          }
+          set_register(r0, lo_res);
+          set_register(r1, hi_res);
+        }
       } else if (redirection->type() == ExternalReference::DIRECT_API_CALL) {
         SimulatorRuntimeDirectApiCall target =
             reinterpret_cast<SimulatorRuntimeDirectApiCall>(external);
@@ -2209,8 +2331,15 @@ void Simulator::DecodeType01(Instruction* instr) {
       }
 
       case ADC: {
-        Format(instr, "adc'cond's 'rd, 'rn, 'shift_rm");
-        Format(instr, "adc'cond's 'rd, 'rn, 'imm");
+        // Format(instr, "adc'cond's 'rd, 'rn, 'shift_rm");
+        // Format(instr, "adc'cond's 'rd, 'rn, 'imm");
+        alu_out = rn_val + shifter_operand + GetCarry();
+        set_register(rd, alu_out);
+        if (instr->HasS()) {
+          SetNZFlags(alu_out);
+          SetCFlag(CarryFrom(rn_val, shifter_operand, GetCarry()));
+          SetVFlag(OverflowFrom(alu_out, rn_val, shifter_operand, true));
+        }
         break;
       }
 
@@ -3195,7 +3324,7 @@ void Simulator::Execute() {
 int32_t Simulator::Call(byte* entry, int argument_count, ...) {
   va_list parameters;
   va_start(parameters, argument_count);
-  // Setup arguments
+  // Set up arguments
 
   // First four arguments passed in registers.
   ASSERT(argument_count >= 4);
@@ -3238,7 +3367,7 @@ int32_t Simulator::Call(byte* entry, int argument_count, ...) {
   int32_t r10_val = get_register(r10);
   int32_t r11_val = get_register(r11);
 
-  // Setup the callee-saved registers with a known value. To be able to check
+  // Set up the callee-saved registers with a known value. To be able to check
   // that they are preserved properly across JS execution.
   int32_t callee_saved_value = icount_;
   set_register(r4, callee_saved_value);

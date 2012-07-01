@@ -198,23 +198,25 @@ void LGapResolver::EmitMove(int index) {
       if (cgen_->IsInteger32Constant(constant_source)) {
         __ movl(dst, Immediate(cgen_->ToInteger32(constant_source)));
       } else {
-        __ Move(dst, cgen_->ToHandle(constant_source));
+        __ LoadObject(dst, cgen_->ToHandle(constant_source));
       }
     } else {
       ASSERT(destination->IsStackSlot());
       Operand dst = cgen_->ToOperand(destination);
       if (cgen_->IsInteger32Constant(constant_source)) {
-        // Allow top 32 bits of an untagged Integer32 to be arbitrary.
-        __ movl(dst, Immediate(cgen_->ToInteger32(constant_source)));
+        // Zero top 32 bits of a 64 bit spill slot that holds a 32 bit untagged
+        // value.
+        __ movq(dst, Immediate(cgen_->ToInteger32(constant_source)));
       } else {
-        __ Move(dst, cgen_->ToHandle(constant_source));
+        __ LoadObject(kScratchRegister, cgen_->ToHandle(constant_source));
+        __ movq(dst, kScratchRegister);
       }
     }
 
   } else if (source->IsDoubleRegister()) {
     XMMRegister src = cgen_->ToDoubleRegister(source);
     if (destination->IsDoubleRegister()) {
-      __ movsd(cgen_->ToDoubleRegister(destination), src);
+      __ movaps(cgen_->ToDoubleRegister(destination), src);
     } else {
       ASSERT(destination->IsDoubleStackSlot());
       __ movsd(cgen_->ToOperand(destination), src);
@@ -273,9 +275,9 @@ void LGapResolver::EmitSwap(int index) {
     // Swap two double registers.
     XMMRegister source_reg = cgen_->ToDoubleRegister(source);
     XMMRegister destination_reg = cgen_->ToDoubleRegister(destination);
-    __ movsd(xmm0, source_reg);
-    __ movsd(source_reg, destination_reg);
-    __ movsd(destination_reg, xmm0);
+    __ movaps(xmm0, source_reg);
+    __ movaps(source_reg, destination_reg);
+    __ movaps(destination_reg, xmm0);
 
   } else if (source->IsDoubleRegister() || destination->IsDoubleRegister()) {
     // Swap a double register and a double stack slot.

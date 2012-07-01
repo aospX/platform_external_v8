@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -47,26 +47,36 @@ namespace v8 {
 namespace internal {
 
 
-void CPU::Setup() {
-  CpuFeatures* cpu_features = Isolate::Current()->cpu_features();
-  cpu_features->Probe(true);
-  if (!cpu_features->IsSupported(FPU) || Serializer::enabled()) {
-    V8::DisableCrankshaft();
-  }
+void CPU::SetUp() {
+  CpuFeatures::Probe();
+}
+
+
+bool CPU::SupportsCrankshaft() {
+  return CpuFeatures::IsSupported(FPU);
 }
 
 
 void CPU::FlushICache(void* start, size_t size) {
+  // Nothing to do, flushing no instructions.
+  if (size == 0) {
+    return;
+  }
+
 #if !defined (USE_SIMULATOR)
+#if defined(ANDROID)
+  // Bionic cacheflush can typically run in userland, avoiding kernel call.
+  char *end = reinterpret_cast<char *>(start) + size;
+  cacheflush(
+    reinterpret_cast<intptr_t>(start), reinterpret_cast<intptr_t>(end), 0);
+#else  // ANDROID
   int res;
-
-  // See http://www.linux-mips.org/wiki/Cacheflush_Syscall
+  // See http://www.linux-mips.org/wiki/Cacheflush_Syscall.
   res = syscall(__NR_cacheflush, start, size, ICACHE);
-
   if (res) {
     V8_Fatal(__FILE__, __LINE__, "Failed to flush the instruction cache");
   }
-
+#endif  // ANDROID
 #else  // USE_SIMULATOR.
   // Not generating mips instructions for C-code. This means that we are
   // building a mips emulator based target.  We should notify the simulator

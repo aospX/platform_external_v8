@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -52,7 +52,9 @@
 
 #include "v8.h"
 
+#include "platform-posix.h"
 #include "platform.h"
+#include "v8threads.h"
 #include "vm-state-inl.h"
 
 
@@ -88,7 +90,8 @@ double ceiling(double x) {
 }
 
 
-void OS::Setup() {
+static Mutex* limit_mutex = NULL;
+void OS::SetUp() {
   // Seed the random number generator.
   // Convert the current time to a 64-bit integer first, before converting it
   // to an unsigned. Going directly will cause an overflow and the seed to be
@@ -96,6 +99,14 @@ void OS::Setup() {
   // call this setup code within the same millisecond.
   uint64_t seed = static_cast<uint64_t>(TimeCurrentMillis());
   srandom(static_cast<unsigned int>(seed));
+  limit_mutex = CreateMutex();
+}
+
+
+void OS::PostSetUp() {
+  // Math functions depend on CPU features therefore they are initialized after
+  // CPU.
+  MathSetup();
 }
 
 
@@ -137,7 +148,7 @@ double OS::LocalTimeOffset() {
 
 // We keep the lowest and highest addresses mapped as a quick way of
 // determining that pointers are outside the heap (used mostly in assertions
-// and verification).  The estimate is conservative, ie, not all addresses in
+// and verification).  The estimate is conservative, i.e., not all addresses in
 // 'allocated' space are actually allocated to our heap.  The range is
 // [lowest, highest), inclusive on the low and and exclusive on the high end.
 static void* lowest_ever_allocated = reinterpret_cast<void*>(-1);
@@ -145,6 +156,9 @@ static void* highest_ever_allocated = reinterpret_cast<void*>(0);
 
 
 static void UpdateAllocatedSpaceLimits(void* address, int size) {
+  ASSERT(limit_mutex != NULL);
+  ScopedLock lock(limit_mutex);
+
   lowest_ever_allocated = Min(lowest_ever_allocated, address);
   highest_ever_allocated =
       Max(highest_ever_allocated,
@@ -185,23 +199,6 @@ void OS::Free(void* address, const size_t size) {
   USE(result);
   ASSERT(result == 0);
 }
-
-
-#ifdef ENABLE_HEAP_PROTECTION
-
-void OS::Protect(void* address, size_t size) {
-  // TODO(1240712): mprotect has a return value which is ignored here.
-  mprotect(address, size, PROT_READ);
-}
-
-
-void OS::Unprotect(void* address, size_t size, bool is_executable) {
-  // TODO(1240712): mprotect has a return value which is ignored here.
-  int prot = PROT_READ | PROT_WRITE | (is_executable ? PROT_EXEC : 0);
-  mprotect(address, size, prot);
-}
-
-#endif
 
 
 void OS::Sleep(int milliseconds) {
@@ -334,43 +331,132 @@ static const int kMmapFd = -1;
 static const int kMmapFdOffset = 0;
 
 
+VirtualMemory::VirtualMemory() : address_(NULL), size_(0) { }
+
 VirtualMemory::VirtualMemory(size_t size) {
-  address_ = mmap(NULL, size, PROT_NONE,
-                  MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
-                  kMmapFd, kMmapFdOffset);
+  address_ = ReserveRegion(size);
   size_ = size;
+}
+
+
+VirtualMemory::VirtualMemory(size_t size, size_t alignment)
+    : address_(NULL), size_(0) {
+  ASSERT(IsAligned(alignment, static_cast<intptr_t>(OS::AllocateAlignment())));
+  size_t request_size = RoundUp(size + alignment,
+                                static_cast<intptr_t>(OS::AllocateAlignment()));
+  void* reservation = mmap(OS::GetRandomMmapAddr(),
+                           request_size,
+                           PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                           kMmapFd,
+                           kMmapFdOffset);
+  if (reservation == MAP_FAILED) return;
+
+  Address base = static_cast<Address>(reservation);
+  Address aligned_base = RoundUp(base, alignment);
+  ASSERT_LE(base, aligned_base);
+
+  // Unmap extra memory reserved before and after the desired block.
+  if (aligned_base != base) {
+    size_t prefix_size = static_cast<size_t>(aligned_base - base);
+    OS::Free(base, prefix_size);
+    request_size -= prefix_size;
+  }
+
+  size_t aligned_size = RoundUp(size, OS::AllocateAlignment());
+  ASSERT_LE(aligned_size, request_size);
+
+  if (aligned_size != request_size) {
+    size_t suffix_size = request_size - aligned_size;
+    OS::Free(aligned_base + aligned_size, suffix_size);
+    request_size -= suffix_size;
+  }
+
+  ASSERT(aligned_size == request_size);
+
+  address_ = static_cast<void*>(aligned_base);
+  size_ = aligned_size;
 }
 
 
 VirtualMemory::~VirtualMemory() {
   if (IsReserved()) {
-    if (0 == munmap(address(), size())) address_ = MAP_FAILED;
+    bool result = ReleaseRegion(address(), size());
+    ASSERT(result);
+    USE(result);
   }
 }
 
 
 bool VirtualMemory::IsReserved() {
-  return address_ != MAP_FAILED;
+  return address_ != NULL;
 }
 
 
-bool VirtualMemory::Commit(void* address, size_t size, bool executable) {
-  int prot = PROT_READ | PROT_WRITE | (executable ? PROT_EXEC : 0);
-  if (MAP_FAILED == mmap(address, size, prot,
-                         MAP_PRIVATE | MAP_ANON | MAP_FIXED,
-                         kMmapFd, kMmapFdOffset)) {
-    return false;
-  }
+void VirtualMemory::Reset() {
+  address_ = NULL;
+  size_ = 0;
+}
 
-  UpdateAllocatedSpaceLimits(address, size);
-  return true;
+
+bool VirtualMemory::Commit(void* address, size_t size, bool is_executable) {
+  return CommitRegion(address, size, is_executable);
 }
 
 
 bool VirtualMemory::Uncommit(void* address, size_t size) {
-  return mmap(address, size, PROT_NONE,
-              MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED,
-              kMmapFd, kMmapFdOffset) != MAP_FAILED;
+  return UncommitRegion(address, size);
+}
+
+
+bool VirtualMemory::Guard(void* address) {
+  OS::Guard(address, OS::CommitPageSize());
+  return true;
+}
+
+
+void* VirtualMemory::ReserveRegion(size_t size) {
+  void* result = mmap(OS::GetRandomMmapAddr(),
+                      size,
+                      PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                      kMmapFd,
+                      kMmapFdOffset);
+
+  if (result == MAP_FAILED) return NULL;
+
+  return result;
+}
+
+
+bool VirtualMemory::CommitRegion(void* base, size_t size, bool is_executable) {
+  int prot = PROT_READ | PROT_WRITE | (is_executable ? PROT_EXEC : 0);
+  if (MAP_FAILED == mmap(base,
+                         size,
+                         prot,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                         kMmapFd,
+                         kMmapFdOffset)) {
+    return false;
+  }
+
+  UpdateAllocatedSpaceLimits(base, size);
+  return true;
+}
+
+
+bool VirtualMemory::UncommitRegion(void* base, size_t size) {
+  return mmap(base,
+              size,
+              PROT_NONE,
+              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED,
+              kMmapFd,
+              kMmapFdOffset) != MAP_FAILED;
+}
+
+
+bool VirtualMemory::ReleaseRegion(void* base, size_t size) {
+  return munmap(base, size) == 0;
 }
 
 
@@ -381,19 +467,11 @@ class Thread::PlatformData : public Malloced {
   pthread_t thread_;  // Thread handle for pthread.
 };
 
-Thread::Thread(Isolate* isolate, const Options& options)
-    : data_(new PlatformData()),
-      isolate_(isolate),
-      stack_size_(options.stack_size) {
-  set_name(options.name);
-}
 
-
-Thread::Thread(Isolate* isolate, const char* name)
+Thread::Thread(const Options& options)
     : data_(new PlatformData()),
-      isolate_(isolate),
-      stack_size_(0) {
-  set_name(name);
+      stack_size_(options.stack_size()) {
+  set_name(options.name());
 }
 
 
@@ -409,7 +487,6 @@ static void* ThreadEntry(void* arg) {
   // one) so we initialize it here too.
   thread->data()->thread_ = pthread_self();
   ASSERT(thread->data()->thread_ != kNoThread);
-  Thread::SetThreadLocal(Isolate::isolate_key(), thread->isolate());
   thread->Run();
   return NULL;
 }
@@ -475,7 +552,6 @@ void Thread::YieldCPU() {
 
 class SolarisMutex : public Mutex {
  public:
-
   SolarisMutex() {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -587,80 +663,173 @@ Semaphore* OS::CreateSemaphore(int count) {
 }
 
 
-#ifdef ENABLE_LOGGING_AND_PROFILING
-
-static Sampler* active_sampler_ = NULL;
-static pthread_t vm_tid_ = 0;
-
-
 static pthread_t GetThreadID() {
   return pthread_self();
 }
 
-
 static void ProfilerSignalHandler(int signal, siginfo_t* info, void* context) {
   USE(info);
   if (signal != SIGPROF) return;
-  if (active_sampler_ == NULL || !active_sampler_->IsActive()) return;
-  if (vm_tid_ != GetThreadID()) return;
+  Isolate* isolate = Isolate::UncheckedCurrent();
+  if (isolate == NULL || !isolate->IsInitialized() || !isolate->IsInUse()) {
+    // We require a fully initialized and entered isolate.
+    return;
+  }
+  if (v8::Locker::IsActive() &&
+      !isolate->thread_manager()->IsLockedByCurrentThread()) {
+    return;
+  }
+
+  Sampler* sampler = isolate->logger()->sampler();
+  if (sampler == NULL || !sampler->IsActive()) return;
 
   TickSample sample_obj;
-  TickSample* sample = CpuProfiler::TickSampleEvent();
+  TickSample* sample = CpuProfiler::TickSampleEvent(isolate);
   if (sample == NULL) sample = &sample_obj;
 
   // Extracting the sample from the context is extremely machine dependent.
   ucontext_t* ucontext = reinterpret_cast<ucontext_t*>(context);
   mcontext_t& mcontext = ucontext->uc_mcontext;
-  sample->state = Top::current_vm_state();
+  sample->state = isolate->current_vm_state();
 
   sample->pc = reinterpret_cast<Address>(mcontext.gregs[REG_PC]);
   sample->sp = reinterpret_cast<Address>(mcontext.gregs[REG_SP]);
   sample->fp = reinterpret_cast<Address>(mcontext.gregs[REG_FP]);
 
-  active_sampler_->SampleStack(sample);
-  active_sampler_->Tick(sample);
+  sampler->SampleStack(sample);
+  sampler->Tick(sample);
 }
-
 
 class Sampler::PlatformData : public Malloced {
  public:
+  PlatformData() : vm_tid_(GetThreadID()) {}
+
+  pthread_t vm_tid() const { return vm_tid_; }
+
+ private:
+  pthread_t vm_tid_;
+};
+
+
+class SignalSender : public Thread {
+ public:
   enum SleepInterval {
-    FULL_INTERVAL,
-    HALF_INTERVAL
+    HALF_INTERVAL,
+    FULL_INTERVAL
   };
 
-  explicit PlatformData(Sampler* sampler)
-      : sampler_(sampler),
-        signal_handler_installed_(false),
-        vm_tgid_(getpid()),
-        signal_sender_launched_(false) {
+  static const int kSignalSenderStackSize = 64 * KB;
+
+  explicit SignalSender(int interval)
+      : Thread(Thread::Options("SignalSender", kSignalSenderStackSize)),
+        interval_(interval) {}
+
+  static void InstallSignalHandler() {
+    struct sigaction sa;
+    sa.sa_sigaction = ProfilerSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_SIGINFO;
+    signal_handler_installed_ =
+        (sigaction(SIGPROF, &sa, &old_signal_handler_) == 0);
   }
 
-  void SignalSender() {
-    while (sampler_->IsActive()) {
-      if (rate_limiter_.SuspendIfNecessary()) continue;
-      if (sampler_->IsProfiling() && RuntimeProfiler::IsEnabled()) {
-        SendProfilingSignal();
+  static void RestoreSignalHandler() {
+    if (signal_handler_installed_) {
+      sigaction(SIGPROF, &old_signal_handler_, 0);
+      signal_handler_installed_ = false;
+    }
+  }
+
+  static void AddActiveSampler(Sampler* sampler) {
+    ScopedLock lock(mutex_.Pointer());
+    SamplerRegistry::AddActiveSampler(sampler);
+    if (instance_ == NULL) {
+      // Start a thread that will send SIGPROF signal to VM threads,
+      // when CPU profiling will be enabled.
+      instance_ = new SignalSender(sampler->interval());
+      instance_->Start();
+    } else {
+      ASSERT(instance_->interval_ == sampler->interval());
+    }
+  }
+
+  static void RemoveActiveSampler(Sampler* sampler) {
+    ScopedLock lock(mutex_.Pointer());
+    SamplerRegistry::RemoveActiveSampler(sampler);
+    if (SamplerRegistry::GetState() == SamplerRegistry::HAS_NO_SAMPLERS) {
+      RuntimeProfiler::StopRuntimeProfilerThreadBeforeShutdown(instance_);
+      delete instance_;
+      instance_ = NULL;
+      RestoreSignalHandler();
+    }
+  }
+
+  // Implement Thread::Run().
+  virtual void Run() {
+    SamplerRegistry::State state;
+    while ((state = SamplerRegistry::GetState()) !=
+           SamplerRegistry::HAS_NO_SAMPLERS) {
+      bool cpu_profiling_enabled =
+          (state == SamplerRegistry::HAS_CPU_PROFILING_SAMPLERS);
+      bool runtime_profiler_enabled = RuntimeProfiler::IsEnabled();
+      if (cpu_profiling_enabled && !signal_handler_installed_) {
+        InstallSignalHandler();
+      } else if (!cpu_profiling_enabled && signal_handler_installed_) {
+        RestoreSignalHandler();
+      }
+
+      // When CPU profiling is enabled both JavaScript and C++ code is
+      // profiled. We must not suspend.
+      if (!cpu_profiling_enabled) {
+        if (rate_limiter_.SuspendIfNecessary()) continue;
+      }
+      if (cpu_profiling_enabled && runtime_profiler_enabled) {
+        if (!SamplerRegistry::IterateActiveSamplers(&DoCpuProfile, this)) {
+          return;
+        }
         Sleep(HALF_INTERVAL);
-        RuntimeProfiler::NotifyTick();
+        if (!SamplerRegistry::IterateActiveSamplers(&DoRuntimeProfile, NULL)) {
+          return;
+        }
         Sleep(HALF_INTERVAL);
       } else {
-        if (sampler_->IsProfiling()) SendProfilingSignal();
-        if (RuntimeProfiler::IsEnabled()) RuntimeProfiler::NotifyTick();
+        if (cpu_profiling_enabled) {
+          if (!SamplerRegistry::IterateActiveSamplers(&DoCpuProfile,
+                                                      this)) {
+            return;
+          }
+        }
+        if (runtime_profiler_enabled) {
+          if (!SamplerRegistry::IterateActiveSamplers(&DoRuntimeProfile,
+                                                      NULL)) {
+            return;
+          }
+        }
         Sleep(FULL_INTERVAL);
       }
     }
   }
 
-  void SendProfilingSignal() {
+  static void DoCpuProfile(Sampler* sampler, void* raw_sender) {
+    if (!sampler->IsProfiling()) return;
+    SignalSender* sender = reinterpret_cast<SignalSender*>(raw_sender);
+    sender->SendProfilingSignal(sampler->platform_data()->vm_tid());
+  }
+
+  static void DoRuntimeProfile(Sampler* sampler, void* ignored) {
+    if (!sampler->isolate()->IsInitialized()) return;
+    sampler->isolate()->runtime_profiler()->NotifyTick();
+  }
+
+  void SendProfilingSignal(pthread_t tid) {
     if (!signal_handler_installed_) return;
-    pthread_kill(vm_tid_, SIGPROF);
+    pthread_kill(tid, SIGPROF);
   }
 
   void Sleep(SleepInterval full_or_half) {
     // Convert ms to us and subtract 100 us to compensate delays
     // occuring during signal delivery.
-    useconds_t interval = sampler_->interval_ * 1000 - 100;
+    useconds_t interval = interval_ * 1000 - 100;
     if (full_or_half == HALF_INTERVAL) interval /= 2;
     int result = usleep(interval);
 #ifdef DEBUG
@@ -675,22 +844,23 @@ class Sampler::PlatformData : public Malloced {
     USE(result);
   }
 
-  Sampler* sampler_;
-  bool signal_handler_installed_;
-  struct sigaction old_signal_handler_;
-  int vm_tgid_;
-  bool signal_sender_launched_;
-  pthread_t signal_sender_thread_;
+  const int interval_;
   RuntimeProfilerRateLimiter rate_limiter_;
+
+  // Protects the process wide state below.
+  static LazyMutex mutex_;
+  static SignalSender* instance_;
+  static bool signal_handler_installed_;
+  static struct sigaction old_signal_handler_;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(SignalSender);
 };
 
-
-static void* SenderEntry(void* arg) {
-  Sampler::PlatformData* data =
-      reinterpret_cast<Sampler::PlatformData*>(arg);
-  data->SignalSender();
-  return 0;
-}
+LazyMutex SignalSender::mutex_ = LAZY_MUTEX_INITIALIZER;
+SignalSender* SignalSender::instance_ = NULL;
+struct sigaction SignalSender::old_signal_handler_;
+bool SignalSender::signal_handler_installed_ = false;
 
 
 Sampler::Sampler(Isolate* isolate, int interval)
@@ -699,65 +869,27 @@ Sampler::Sampler(Isolate* isolate, int interval)
       profiling_(false),
       active_(false),
       samples_taken_(0) {
-  data_ = new PlatformData(this);
+  data_ = new PlatformData;
 }
 
 
 Sampler::~Sampler() {
-  ASSERT(!data_->signal_sender_launched_);
+  ASSERT(!IsActive());
   delete data_;
 }
 
 
 void Sampler::Start() {
-  // There can only be one active sampler at the time on POSIX
-  // platforms.
   ASSERT(!IsActive());
-  vm_tid_ = GetThreadID();
-
-  // Request profiling signals.
-  struct sigaction sa;
-  sa.sa_sigaction = ProfilerSignalHandler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_RESTART | SA_SIGINFO;
-  data_->signal_handler_installed_ =
-      sigaction(SIGPROF, &sa, &data_->old_signal_handler_) == 0;
-
-  // Start a thread that sends SIGPROF signal to VM thread.
-  // Sending the signal ourselves instead of relying on itimer provides
-  // much better accuracy.
   SetActive(true);
-  if (pthread_create(
-          &data_->signal_sender_thread_, NULL, SenderEntry, data_) == 0) {
-    data_->signal_sender_launched_ = true;
-  }
-
-  // Set this sampler as the active sampler.
-  active_sampler_ = this;
+  SignalSender::AddActiveSampler(this);
 }
 
 
 void Sampler::Stop() {
+  ASSERT(IsActive());
+  SignalSender::RemoveActiveSampler(this);
   SetActive(false);
-
-  // Wait for signal sender termination (it will exit after setting
-  // active_ to false).
-  if (data_->signal_sender_launched_) {
-    Top::WakeUpRuntimeProfilerThreadBeforeShutdown();
-    pthread_join(data_->signal_sender_thread_, NULL);
-    data_->signal_sender_launched_ = false;
-  }
-
-  // Restore old signal handler
-  if (data_->signal_handler_installed_) {
-    sigaction(SIGPROF, &data_->old_signal_handler_, 0);
-    data_->signal_handler_installed_ = false;
-  }
-
-  // This sampler is no longer the active sampler.
-  active_sampler_ = NULL;
 }
-
-#endif  // ENABLE_LOGGING_AND_PROFILING
 
 } }  // namespace v8::internal

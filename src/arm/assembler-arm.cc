@@ -51,31 +51,52 @@ unsigned CpuFeatures::supported_ = 0;
 unsigned CpuFeatures::found_by_runtime_probing_ = 0;
 
 
-#ifdef __arm__
+// Get the CPU features enabled by the build. For cross compilation the
+// preprocessor symbols CAN_USE_ARMV7_INSTRUCTIONS and CAN_USE_VFP_INSTRUCTIONS
+// can be defined to enable ARMv7 and VFPv3 instructions when building the
+// snapshot.
 static uint64_t CpuFeaturesImpliedByCompiler() {
   uint64_t answer = 0;
 #ifdef CAN_USE_ARMV7_INSTRUCTIONS
   answer |= 1u << ARMv7;
 #endif  // def CAN_USE_ARMV7_INSTRUCTIONS
-  // If the compiler is allowed to use VFP then we can use VFP too in our code
-  // generation even when generating snapshots.  This won't work for cross
-  // compilation. VFPv3 implies ARMv7, see ARM DDI 0406B, page A1-6.
-#if defined(__VFP_FP__) && !defined(__SOFTFP__)
-  answer |= 1u << VFP3 | 1u << ARMv7;
-#endif  // defined(__VFP_FP__) && !defined(__SOFTFP__)
 #ifdef CAN_USE_VFP_INSTRUCTIONS
   answer |= 1u << VFP3 | 1u << ARMv7;
 #endif  // def CAN_USE_VFP_INSTRUCTIONS
+
+#ifdef __arm__
+  // If the compiler is allowed to use VFP then we can use VFP too in our code
+  // generation even when generating snapshots. ARMv7 and hardware floating
+  // point support implies VFPv3, see ARM DDI 0406B, page A1-6.
+#if defined(CAN_USE_ARMV7_INSTRUCTIONS) && defined(__VFP_FP__) \
+    && !defined(__SOFTFP__)
+  answer |= 1u << VFP3 | 1u << ARMv7;
+#endif  // defined(CAN_USE_ARMV7_INSTRUCTIONS) && defined(__VFP_FP__)
+        // && !defined(__SOFTFP__)
+#endif  // def __arm__
+
   return answer;
 }
-#endif  // def __arm__
 
 
 void CpuFeatures::Probe() {
-  ASSERT(!initialized_);
+  unsigned standard_features = (OS::CpuFeaturesImpliedByPlatform() |
+                                CpuFeaturesImpliedByCompiler());
+  ASSERT(supported_ == 0 || supported_ == standard_features);
 #ifdef DEBUG
   initialized_ = true;
 #endif
+
+  // Get the features implied by the OS and the compiler settings. This is the
+  // minimal set of features which is also alowed for generated code in the
+  // snapshot.
+  supported_ |= standard_features;
+
+  if (Serializer::enabled()) {
+    // No probing for features if we might serialize (generate snapshot).
+    return;
+  }
+
 #ifndef __arm__
   // For the simulator=arm build, use VFP when FLAG_enable_vfp3 is
   // enabled. VFPv3 implies ARMv7, see ARM DDI 0406B, page A1-6.
@@ -87,13 +108,8 @@ void CpuFeatures::Probe() {
     supported_ |= 1u << ARMv7;
   }
 #else  // def __arm__
-  if (Serializer::enabled()) {
-    supported_ |= OS::CpuFeaturesImpliedByPlatform();
-    supported_ |= CpuFeaturesImpliedByCompiler();
-    return;  // No features if we might serialize.
-  }
-
-  if (OS::ArmCpuHasFeature(VFP3)) {
+  // Probe for additional features not already known to be available.
+  if (!IsSupported(VFP3) && OS::ArmCpuHasFeature(VFP3)) {
     // This implementation also sets the VFP flags if runtime
     // detection of VFP returns true. VFPv3 implies ARMv7, see ARM DDI
     // 0406B, page A1-6.
@@ -101,7 +117,7 @@ void CpuFeatures::Probe() {
     found_by_runtime_probing_ |= 1u << VFP3 | 1u << ARMv7;
   }
 
-  if (OS::ArmCpuHasFeature(ARMv7)) {
+  if (!IsSupported(ARMv7) && OS::ArmCpuHasFeature(ARMv7)) {
     supported_ |= 1u << ARMv7;
     found_by_runtime_probing_ |= 1u << ARMv7;
   }
@@ -121,7 +137,6 @@ bool RelocInfo::IsCodedSpecially() {
   // generate those yet.
   return false;
 }
-
 
 
 void RelocInfo::PatchCode(byte* instructions, int instruction_count) {
@@ -222,25 +237,27 @@ MemOperand::MemOperand(Register rn, Register rm,
 
 // add(sp, sp, 4) instruction (aka Pop())
 const Instr kPopInstruction =
-    al | PostIndex | 4 | LeaveCC | I | sp.code() * B16 | sp.code() * B12;
+    al | PostIndex | 4 | LeaveCC | I | kRegister_sp_Code * B16 |
+        kRegister_sp_Code * B12;
 // str(r, MemOperand(sp, 4, NegPreIndex), al) instruction (aka push(r))
 // register r is not encoded.
 const Instr kPushRegPattern =
-    al | B26 | 4 | NegPreIndex | sp.code() * B16;
+    al | B26 | 4 | NegPreIndex | kRegister_sp_Code * B16;
 // ldr(r, MemOperand(sp, 4, PostIndex), al) instruction (aka pop(r))
 // register r is not encoded.
 const Instr kPopRegPattern =
-    al | B26 | L | 4 | PostIndex | sp.code() * B16;
+    al | B26 | L | 4 | PostIndex | kRegister_sp_Code * B16;
 // mov lr, pc
-const Instr kMovLrPc = al | MOV | pc.code() | lr.code() * B12;
+const Instr kMovLrPc = al | MOV | kRegister_pc_Code | kRegister_lr_Code * B12;
 // ldr rd, [pc, #offset]
 const Instr kLdrPCMask = kCondMask | 15 * B24 | 7 * B20 | 15 * B16;
-const Instr kLdrPCPattern = al | 5 * B24 | L | pc.code() * B16;
+const Instr kLdrPCPattern = al | 5 * B24 | L | kRegister_pc_Code * B16;
 // blxcc rm
 const Instr kBlxRegMask =
     15 * B24 | 15 * B20 | 15 * B16 | 15 * B12 | 15 * B8 | 15 * B4;
 const Instr kBlxRegPattern =
     B24 | B21 | 15 * B16 | 15 * B12 | 15 * B8 | BLX;
+const Instr kBlxIp = al | kBlxRegPattern | ip.code();
 const Instr kMovMvnMask = 0x6d * B21 | 0xf * B16;
 const Instr kMovMvnPattern = 0xd * B21;
 const Instr kMovMvnFlip = B22;
@@ -257,13 +274,13 @@ const Instr kAndBicFlip = 0xe * B21;
 
 // A mask for the Rd register for push, pop, ldr, str instructions.
 const Instr kLdrRegFpOffsetPattern =
-    al | B26 | L | Offset | fp.code() * B16;
+    al | B26 | L | Offset | kRegister_fp_Code * B16;
 const Instr kStrRegFpOffsetPattern =
-    al | B26 | Offset | fp.code() * B16;
+    al | B26 | Offset | kRegister_fp_Code * B16;
 const Instr kLdrRegFpNegOffsetPattern =
-    al | B26 | L | NegOffset | fp.code() * B16;
+    al | B26 | L | NegOffset | kRegister_fp_Code * B16;
 const Instr kStrRegFpNegOffsetPattern =
-    al | B26 | NegOffset | fp.code() * B16;
+    al | B26 | NegOffset | kRegister_fp_Code * B16;
 const Instr kLdrStrInstrTypeMask = 0xffff0000;
 const Instr kLdrStrInstrArgumentMask = 0x0000ffff;
 const Instr kLdrStrOffsetMask = 0x00000fff;
@@ -276,9 +293,7 @@ static const int kMinimalBufferSize = 4*KB;
 Assembler::Assembler(Isolate* arg_isolate, void* buffer, int buffer_size)
     : AssemblerBase(arg_isolate),
       positions_recorder_(this),
-      allow_peephole_optimization_(false),
       emit_debug_code_(FLAG_debug_code) {
-  allow_peephole_optimization_ = FLAG_peephole_optimization;
   if (buffer == NULL) {
     // Do our own buffer management.
     if (buffer_size <= kMinimalBufferSize) {
@@ -305,16 +320,17 @@ Assembler::Assembler(Isolate* arg_isolate, void* buffer, int buffer_size)
     own_buffer_ = false;
   }
 
-  // Setup buffer pointers.
+  // Set up buffer pointers.
   ASSERT(buffer_ != NULL);
   pc_ = buffer_;
   reloc_info_writer.Reposition(buffer_ + buffer_size, pc_);
-  num_prinfo_ = 0;
+  num_pending_reloc_info_ = 0;
   next_buffer_check_ = 0;
   const_pool_blocked_nesting_ = 0;
   no_const_pool_before_ = 0;
-  last_const_pool_end_ = 0;
+  first_const_pool_use_ = -1;
   last_bound_pos_ = 0;
+  ClearRecordedAstId();
 }
 
 
@@ -334,9 +350,9 @@ Assembler::~Assembler() {
 void Assembler::GetCode(CodeDesc* desc) {
   // Emit constant pool if necessary.
   CheckConstPool(true, false);
-  ASSERT(num_prinfo_ == 0);
+  ASSERT(num_pending_reloc_info_ == 0);
 
-  // Setup code descriptor.
+  // Set up code descriptor.
   desc->buffer = buffer_;
   desc->buffer_size = buffer_size_;
   desc->instr_size = pc_offset();
@@ -680,11 +696,11 @@ void Assembler::bind(Label* L) {
 void Assembler::next(Label* L) {
   ASSERT(L->is_linked());
   int link = target_at(L->pos());
-  if (link > 0) {
-    L->link_to(link);
-  } else {
-    ASSERT(link == kEndOfChain);
+  if (link == kEndOfChain) {
     L->Unuse();
+  } else {
+    ASSERT(link >= 0);
+    L->link_to(link);
   }
 }
 
@@ -861,7 +877,7 @@ void Assembler::addrmod1(Instr instr,
   emit(instr | rn.code()*B16 | rd.code()*B12);
   if (rn.is(pc) || x.rm_.is(pc)) {
     // Block constant pool emission for one instruction after reading pc.
-    BlockConstPoolBefore(pc_offset() + kInstrSize);
+    BlockConstPoolFor(1);
   }
 }
 
@@ -985,7 +1001,7 @@ int Assembler::branch_offset(Label* L, bool jump_elimination_allowed) {
 
   // Block the emission of the constant pool, since the branch instruction must
   // be emitted at the pc offset recorded by the label.
-  BlockConstPoolBefore(pc_offset() + kInstrSize);
+  BlockConstPoolFor(1);
   return target_pos - (pc_offset() + kPcLoadDelta);
 }
 
@@ -1082,20 +1098,6 @@ void Assembler::rsb(Register dst, Register src1, const Operand& src2,
 void Assembler::add(Register dst, Register src1, const Operand& src2,
                     SBit s, Condition cond) {
   addrmod1(cond | ADD | s, src1, dst, src2);
-
-  // Eliminate pattern: push(r), pop()
-  //   str(src, MemOperand(sp, 4, NegPreIndex), al);
-  //   add(sp, sp, Operand(kPointerSize));
-  // Both instructions can be eliminated.
-  if (can_peephole_optimize(2) &&
-      // Pattern.
-      instr_at(pc_ - 1 * kInstrSize) == kPopInstruction &&
-      (instr_at(pc_ - 2 * kInstrSize) & ~kRdMask) == kPushRegPattern) {
-    pc_ -= 2 * kInstrSize;
-    if (FLAG_print_peephole_optimization) {
-      PrintF("%x push(reg)/pop() eliminated\n", pc_offset());
-    }
-  }
 }
 
 
@@ -1400,195 +1402,11 @@ void Assembler::ldr(Register dst, const MemOperand& src, Condition cond) {
     positions_recorder()->WriteRecordedPositions();
   }
   addrmod2(cond | B26 | L, dst, src);
-
-  // Eliminate pattern: push(ry), pop(rx)
-  //   str(ry, MemOperand(sp, 4, NegPreIndex), al)
-  //   ldr(rx, MemOperand(sp, 4, PostIndex), al)
-  // Both instructions can be eliminated if ry = rx.
-  // If ry != rx, a register copy from ry to rx is inserted
-  // after eliminating the push and the pop instructions.
-  if (can_peephole_optimize(2)) {
-    Instr push_instr = instr_at(pc_ - 2 * kInstrSize);
-    Instr pop_instr = instr_at(pc_ - 1 * kInstrSize);
-
-    if (IsPush(push_instr) && IsPop(pop_instr)) {
-      if (Instruction::RdValue(pop_instr) != Instruction::RdValue(push_instr)) {
-        // For consecutive push and pop on different registers,
-        // we delete both the push & pop and insert a register move.
-        // push ry, pop rx --> mov rx, ry
-        Register reg_pushed, reg_popped;
-        reg_pushed = GetRd(push_instr);
-        reg_popped = GetRd(pop_instr);
-        pc_ -= 2 * kInstrSize;
-        // Insert a mov instruction, which is better than a pair of push & pop
-        mov(reg_popped, reg_pushed);
-        if (FLAG_print_peephole_optimization) {
-          PrintF("%x push/pop (diff reg) replaced by a reg move\n",
-                 pc_offset());
-        }
-      } else {
-        // For consecutive push and pop on the same register,
-        // both the push and the pop can be deleted.
-        pc_ -= 2 * kInstrSize;
-        if (FLAG_print_peephole_optimization) {
-          PrintF("%x push/pop (same reg) eliminated\n", pc_offset());
-        }
-      }
-    }
-  }
-
-  if (can_peephole_optimize(2)) {
-    Instr str_instr = instr_at(pc_ - 2 * kInstrSize);
-    Instr ldr_instr = instr_at(pc_ - 1 * kInstrSize);
-
-    if ((IsStrRegFpOffset(str_instr) &&
-         IsLdrRegFpOffset(ldr_instr)) ||
-       (IsStrRegFpNegOffset(str_instr) &&
-         IsLdrRegFpNegOffset(ldr_instr))) {
-      if ((ldr_instr & kLdrStrInstrArgumentMask) ==
-            (str_instr & kLdrStrInstrArgumentMask)) {
-        // Pattern: Ldr/str same fp+offset, same register.
-        //
-        // The following:
-        // str rx, [fp, #-12]
-        // ldr rx, [fp, #-12]
-        //
-        // Becomes:
-        // str rx, [fp, #-12]
-
-        pc_ -= 1 * kInstrSize;
-        if (FLAG_print_peephole_optimization) {
-          PrintF("%x str/ldr (fp + same offset), same reg\n", pc_offset());
-        }
-      } else if ((ldr_instr & kLdrStrOffsetMask) ==
-                 (str_instr & kLdrStrOffsetMask)) {
-        // Pattern: Ldr/str same fp+offset, different register.
-        //
-        // The following:
-        // str rx, [fp, #-12]
-        // ldr ry, [fp, #-12]
-        //
-        // Becomes:
-        // str rx, [fp, #-12]
-        // mov ry, rx
-
-        Register reg_stored, reg_loaded;
-        reg_stored = GetRd(str_instr);
-        reg_loaded = GetRd(ldr_instr);
-        pc_ -= 1 * kInstrSize;
-        // Insert a mov instruction, which is better than ldr.
-        mov(reg_loaded, reg_stored);
-        if (FLAG_print_peephole_optimization) {
-          PrintF("%x str/ldr (fp + same offset), diff reg \n", pc_offset());
-        }
-      }
-    }
-  }
-
-  if (can_peephole_optimize(3)) {
-    Instr mem_write_instr = instr_at(pc_ - 3 * kInstrSize);
-    Instr ldr_instr = instr_at(pc_ - 2 * kInstrSize);
-    Instr mem_read_instr = instr_at(pc_ - 1 * kInstrSize);
-    if (IsPush(mem_write_instr) &&
-        IsPop(mem_read_instr)) {
-      if ((IsLdrRegFpOffset(ldr_instr) ||
-        IsLdrRegFpNegOffset(ldr_instr))) {
-        if (Instruction::RdValue(mem_write_instr) ==
-                                  Instruction::RdValue(mem_read_instr)) {
-          // Pattern: push & pop from/to same register,
-          // with a fp+offset ldr in between
-          //
-          // The following:
-          // str rx, [sp, #-4]!
-          // ldr rz, [fp, #-24]
-          // ldr rx, [sp], #+4
-          //
-          // Becomes:
-          // if(rx == rz)
-          //   delete all
-          // else
-          //   ldr rz, [fp, #-24]
-
-          if (Instruction::RdValue(mem_write_instr) ==
-              Instruction::RdValue(ldr_instr)) {
-            pc_ -= 3 * kInstrSize;
-          } else {
-            pc_ -= 3 * kInstrSize;
-            // Reinsert back the ldr rz.
-            emit(ldr_instr);
-          }
-          if (FLAG_print_peephole_optimization) {
-            PrintF("%x push/pop -dead ldr fp+offset in middle\n", pc_offset());
-          }
-        } else {
-          // Pattern: push & pop from/to different registers
-          // with a fp+offset ldr in between
-          //
-          // The following:
-          // str rx, [sp, #-4]!
-          // ldr rz, [fp, #-24]
-          // ldr ry, [sp], #+4
-          //
-          // Becomes:
-          // if(ry == rz)
-          //   mov ry, rx;
-          // else if(rx != rz)
-          //   ldr rz, [fp, #-24]
-          //   mov ry, rx
-          // else if((ry != rz) || (rx == rz)) becomes:
-          //   mov ry, rx
-          //   ldr rz, [fp, #-24]
-
-          Register reg_pushed, reg_popped;
-          if (Instruction::RdValue(mem_read_instr) ==
-              Instruction::RdValue(ldr_instr)) {
-            reg_pushed = GetRd(mem_write_instr);
-            reg_popped = GetRd(mem_read_instr);
-            pc_ -= 3 * kInstrSize;
-            mov(reg_popped, reg_pushed);
-          } else if (Instruction::RdValue(mem_write_instr) !=
-                     Instruction::RdValue(ldr_instr)) {
-            reg_pushed = GetRd(mem_write_instr);
-            reg_popped = GetRd(mem_read_instr);
-            pc_ -= 3 * kInstrSize;
-            emit(ldr_instr);
-            mov(reg_popped, reg_pushed);
-          } else if ((Instruction::RdValue(mem_read_instr) !=
-                      Instruction::RdValue(ldr_instr)) ||
-                     (Instruction::RdValue(mem_write_instr) ==
-                      Instruction::RdValue(ldr_instr))) {
-            reg_pushed = GetRd(mem_write_instr);
-            reg_popped = GetRd(mem_read_instr);
-            pc_ -= 3 * kInstrSize;
-            mov(reg_popped, reg_pushed);
-            emit(ldr_instr);
-          }
-          if (FLAG_print_peephole_optimization) {
-            PrintF("%x push/pop (ldr fp+off in middle)\n", pc_offset());
-          }
-        }
-      }
-    }
-  }
 }
 
 
 void Assembler::str(Register src, const MemOperand& dst, Condition cond) {
   addrmod2(cond | B26, src, dst);
-
-  // Eliminate pattern: pop(), push(r)
-  //     add sp, sp, #4 LeaveCC, al; str r, [sp, #-4], al
-  // ->  str r, [sp, 0], al
-  if (can_peephole_optimize(2) &&
-     // Pattern.
-     instr_at(pc_ - 1 * kInstrSize) == (kPushRegPattern | src.code() * B12) &&
-     instr_at(pc_ - 2 * kInstrSize) == kPopInstruction) {
-    pc_ -= 2 * kInstrSize;
-    emit(al | B26 | 0 | Offset | sp.code() * B16 | src.code() * B12);
-    if (FLAG_print_peephole_optimization) {
-      PrintF("%x pop()/push(reg) eliminated\n", pc_offset());
-    }
-  }
 }
 
 
@@ -1679,15 +1497,17 @@ void Assembler::stm(BlockAddrMode am,
 void Assembler::stop(const char* msg, Condition cond, int32_t code) {
 #ifndef __arm__
   ASSERT(code >= kDefaultStopCode);
-  // The Simulator will handle the stop instruction and get the message address.
-  // It expects to find the address just after the svc instruction.
-  BlockConstPoolFor(2);
-  if (code >= 0) {
-    svc(kStopCode + code, cond);
-  } else {
-    svc(kStopCode + kMaxStopCode, cond);
+  {
+    // The Simulator will handle the stop instruction and get the message
+    // address. It expects to find the address just after the svc instruction.
+    BlockConstPoolScope block_const_pool(this);
+    if (code >= 0) {
+      svc(kStopCode + code, cond);
+    } else {
+      svc(kStopCode + kMaxStopCode, cond);
+    }
+    emit(reinterpret_cast<Instr>(msg));
   }
-  emit(reinterpret_cast<Instr>(msg));
 #else  // def __arm__
 #ifdef CAN_USE_ARMV5_INSTRUCTIONS
   if (cond != al) {
@@ -2592,11 +2412,6 @@ bool Assembler::ImmediateFitsAddrMode1Instruction(int32_t imm32) {
 }
 
 
-void Assembler::BlockConstPoolFor(int instructions) {
-  BlockConstPoolBefore(pc_offset() + instructions * kInstrSize);
-}
-
-
 // Debugging.
 void Assembler::RecordJSReturn() {
   positions_recorder()->WriteRecordedPositions();
@@ -2634,7 +2449,7 @@ void Assembler::GrowBuffer() {
   }
   CHECK_GT(desc.buffer_size, 0);  // no overflow
 
-  // Setup new buffer.
+  // Set up new buffer.
   desc.buffer = NewArray<byte>(desc.buffer_size);
 
   desc.instr_size = pc_offset();
@@ -2660,8 +2475,8 @@ void Assembler::GrowBuffer() {
   // to relocate any emitted relocation entries.
 
   // Relocate pending relocation entries.
-  for (int i = 0; i < num_prinfo_; i++) {
-    RelocInfo& rinfo = prinfo_[i];
+  for (int i = 0; i < num_pending_reloc_info_; i++) {
+    RelocInfo& rinfo = pending_reloc_info_[i];
     ASSERT(rinfo.rmode() != RelocInfo::COMMENT &&
            rinfo.rmode() != RelocInfo::POSITION);
     if (rinfo.rmode() != RelocInfo::JS_RETURN) {
@@ -2675,7 +2490,7 @@ void Assembler::db(uint8_t data) {
   // No relocation info should be pending while using db. db is used
   // to write pure data with no pointers and the constant pool should
   // be emitted before using db.
-  ASSERT(num_prinfo_ == 0);
+  ASSERT(num_pending_reloc_info_ == 0);
   CheckBuffer();
   *reinterpret_cast<uint8_t*>(pc_) = data;
   pc_ += sizeof(uint8_t);
@@ -2686,7 +2501,7 @@ void Assembler::dd(uint32_t data) {
   // No relocation info should be pending while using dd. dd is used
   // to write pure data with no pointers and the constant pool should
   // be emitted before using dd.
-  ASSERT(num_prinfo_ == 0);
+  ASSERT(num_pending_reloc_info_ == 0);
   CheckBuffer();
   *reinterpret_cast<uint32_t*>(pc_) = data;
   pc_ += sizeof(uint32_t);
@@ -2694,7 +2509,8 @@ void Assembler::dd(uint32_t data) {
 
 
 void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
-  RelocInfo rinfo(pc_, rmode, data);  // we do not try to reuse pool constants
+  // We do not try to reuse pool constants.
+  RelocInfo rinfo(pc_, rmode, data, NULL);
   if (rmode >= RelocInfo::JS_RETURN && rmode <= RelocInfo::DEBUG_BREAK_SLOT) {
     // Adjust code for new modes.
     ASSERT(RelocInfo::IsDebugBreakSlot(rmode)
@@ -2703,11 +2519,14 @@ void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
            || RelocInfo::IsPosition(rmode));
     // These modes do not need an entry in the constant pool.
   } else {
-    ASSERT(num_prinfo_ < kMaxNumPRInfo);
-    prinfo_[num_prinfo_++] = rinfo;
+    ASSERT(num_pending_reloc_info_ < kMaxNumPendingRelocInfo);
+    if (num_pending_reloc_info_ == 0) {
+      first_const_pool_use_ = pc_offset();
+    }
+    pending_reloc_info_[num_pending_reloc_info_++] = rinfo;
     // Make sure the constant pool is not emitted in place of the next
     // instruction for which we just recorded relocation info.
-    BlockConstPoolBefore(pc_offset() + kInstrSize);
+    BlockConstPoolFor(1);
   }
   if (rinfo.rmode() != RelocInfo::NONE) {
     // Don't record external references unless the heap will be serialized.
@@ -2722,116 +2541,123 @@ void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
       }
     }
     ASSERT(buffer_space() >= kMaxRelocSize);  // too late to grow buffer here
-    reloc_info_writer.Write(&rinfo);
+    if (rmode == RelocInfo::CODE_TARGET_WITH_ID) {
+      RelocInfo reloc_info_with_ast_id(pc_, rmode, RecordedAstId(), NULL);
+      ClearRecordedAstId();
+      reloc_info_writer.Write(&reloc_info_with_ast_id);
+    } else {
+      reloc_info_writer.Write(&rinfo);
+    }
+  }
+}
+
+
+void Assembler::BlockConstPoolFor(int instructions) {
+  int pc_limit = pc_offset() + instructions * kInstrSize;
+  if (no_const_pool_before_ < pc_limit) {
+    // If there are some pending entries, the constant pool cannot be blocked
+    // further than first_const_pool_use_ + kMaxDistToPool
+    ASSERT((num_pending_reloc_info_ == 0) ||
+           (pc_limit < (first_const_pool_use_ + kMaxDistToPool)));
+    no_const_pool_before_ = pc_limit;
+  }
+
+  if (next_buffer_check_ < no_const_pool_before_) {
+    next_buffer_check_ = no_const_pool_before_;
   }
 }
 
 
 void Assembler::CheckConstPool(bool force_emit, bool require_jump) {
-  // Calculate the offset of the next check. It will be overwritten
-  // when a const pool is generated or when const pools are being
-  // blocked for a specific range.
-  next_buffer_check_ = pc_offset() + kCheckConstInterval;
-
-  // There is nothing to do if there are no pending relocation info entries.
-  if (num_prinfo_ == 0) return;
-
-  // We emit a constant pool at regular intervals of about kDistBetweenPools
-  // or when requested by parameter force_emit (e.g. after each function).
-  // We prefer not to emit a jump unless the max distance is reached or if we
-  // are running low on slots, which can happen if a lot of constants are being
-  // emitted (e.g. --debug-code and many static references).
-  int dist = pc_offset() - last_const_pool_end_;
-  if (!force_emit && dist < kMaxDistBetweenPools &&
-      (require_jump || dist < kDistBetweenPools) &&
-      // TODO(1236125): Cleanup the "magic" number below. We know that
-      // the code generation will test every kCheckConstIntervalInst.
-      // Thus we are safe as long as we generate less than 7 constant
-      // entries per instruction.
-      (num_prinfo_ < (kMaxNumPRInfo - (7 * kCheckConstIntervalInst)))) {
-    return;
-  }
-
-  // If we did not return by now, we need to emit the constant pool soon.
-
-  // However, some small sequences of instructions must not be broken up by the
-  // insertion of a constant pool; such sequences are protected by setting
-  // either const_pool_blocked_nesting_ or no_const_pool_before_, which are
-  // both checked here. Also, recursive calls to CheckConstPool are blocked by
-  // no_const_pool_before_.
-  if (const_pool_blocked_nesting_ > 0 || pc_offset() < no_const_pool_before_) {
-    // Emission is currently blocked; make sure we try again as soon as
-    // possible.
-    if (const_pool_blocked_nesting_ > 0) {
-      next_buffer_check_ = pc_offset() + kInstrSize;
-    } else {
-      next_buffer_check_ = no_const_pool_before_;
-    }
-
+  // Some short sequence of instruction mustn't be broken up by constant pool
+  // emission, such sequences are protected by calls to BlockConstPoolFor and
+  // BlockConstPoolScope.
+  if (is_const_pool_blocked()) {
     // Something is wrong if emission is forced and blocked at the same time.
     ASSERT(!force_emit);
     return;
   }
 
-  int jump_instr = require_jump ? kInstrSize : 0;
+  // There is nothing to do if there are no pending constant pool entries.
+  if (num_pending_reloc_info_ == 0)  {
+    // Calculate the offset of the next check.
+    next_buffer_check_ = pc_offset() + kCheckPoolInterval;
+    return;
+  }
+
+  // We emit a constant pool when:
+  //  * requested to do so by parameter force_emit (e.g. after each function).
+  //  * the distance to the first instruction accessing the constant pool is
+  //    kAvgDistToPool or more.
+  //  * no jump is required and the distance to the first instruction accessing
+  //    the constant pool is at least kMaxDistToPool / 2.
+  ASSERT(first_const_pool_use_ >= 0);
+  int dist = pc_offset() - first_const_pool_use_;
+  if (!force_emit && dist < kAvgDistToPool &&
+      (require_jump || (dist < (kMaxDistToPool / 2)))) {
+    return;
+  }
 
   // Check that the code buffer is large enough before emitting the constant
-  // pool and relocation information (include the jump over the pool and the
-  // constant pool marker).
-  int max_needed_space =
-      jump_instr + kInstrSize + num_prinfo_*(kInstrSize + kMaxRelocSize);
-  while (buffer_space() <= (max_needed_space + kGap)) GrowBuffer();
+  // pool (include the jump over the pool and the constant pool marker and
+  // the gap to the relocation information).
+  int jump_instr = require_jump ? kInstrSize : 0;
+  int needed_space = jump_instr + kInstrSize +
+                     num_pending_reloc_info_ * kInstrSize + kGap;
+  while (buffer_space() <= needed_space) GrowBuffer();
 
-  // Block recursive calls to CheckConstPool.
-  BlockConstPoolBefore(pc_offset() + jump_instr + kInstrSize +
-                       num_prinfo_*kInstrSize);
-  // Don't bother to check for the emit calls below.
-  next_buffer_check_ = no_const_pool_before_;
+  {
+    // Block recursive calls to CheckConstPool.
+    BlockConstPoolScope block_const_pool(this);
 
-  // Emit jump over constant pool if necessary.
-  Label after_pool;
-  if (require_jump) b(&after_pool);
-
-  RecordComment("[ Constant Pool");
-
-  // Put down constant pool marker "Undefined instruction" as specified by
-  // A5.6 (ARMv7) Instruction set encoding.
-  emit(kConstantPoolMarker | num_prinfo_);
-
-  // Emit constant pool entries.
-  for (int i = 0; i < num_prinfo_; i++) {
-    RelocInfo& rinfo = prinfo_[i];
-    ASSERT(rinfo.rmode() != RelocInfo::COMMENT &&
-           rinfo.rmode() != RelocInfo::POSITION &&
-           rinfo.rmode() != RelocInfo::STATEMENT_POSITION);
-    Instr instr = instr_at(rinfo.pc());
-
-    // Instruction to patch must be a ldr/str [pc, #offset].
-    // P and U set, B and W clear, Rn == pc, offset12 still 0.
-    ASSERT((instr & (7*B25 | P | U | B | W | 15*B16 | kOff12Mask)) ==
-           (2*B25 | P | U | pc.code()*B16));
-    int delta = pc_ - rinfo.pc() - 8;
-    ASSERT(delta >= -4);  // instr could be ldr pc, [pc, #-4] followed by targ32
-    if (delta < 0) {
-      instr &= ~U;
-      delta = -delta;
+    // Emit jump over constant pool if necessary.
+    Label after_pool;
+    if (require_jump) {
+      b(&after_pool);
     }
-    ASSERT(is_uint12(delta));
-    instr_at_put(rinfo.pc(), instr + delta);
-    emit(rinfo.data());
-  }
-  num_prinfo_ = 0;
-  last_const_pool_end_ = pc_offset();
 
-  RecordComment("]");
+    RecordComment("[ Constant Pool");
 
-  if (after_pool.is_linked()) {
-    bind(&after_pool);
+    // Put down constant pool marker "Undefined instruction" as specified by
+    // A5.6 (ARMv7) Instruction set encoding.
+    emit(kConstantPoolMarker | num_pending_reloc_info_);
+
+    // Emit constant pool entries.
+    for (int i = 0; i < num_pending_reloc_info_; i++) {
+      RelocInfo& rinfo = pending_reloc_info_[i];
+      ASSERT(rinfo.rmode() != RelocInfo::COMMENT &&
+             rinfo.rmode() != RelocInfo::POSITION &&
+             rinfo.rmode() != RelocInfo::STATEMENT_POSITION);
+
+      Instr instr = instr_at(rinfo.pc());
+      // Instruction to patch must be 'ldr rd, [pc, #offset]' with offset == 0.
+      ASSERT(IsLdrPcImmediateOffset(instr) &&
+             GetLdrRegisterImmediateOffset(instr) == 0);
+
+      int delta = pc_ - rinfo.pc() - kPcLoadDelta;
+      // 0 is the smallest delta:
+      //   ldr rd, [pc, #0]
+      //   constant pool marker
+      //   data
+      ASSERT(is_uint12(delta));
+
+      instr_at_put(rinfo.pc(), SetLdrRegisterImmediateOffset(instr, delta));
+      emit(rinfo.data());
+    }
+
+    num_pending_reloc_info_ = 0;
+    first_const_pool_use_ = -1;
+
+    RecordComment("]");
+
+    if (after_pool.is_linked()) {
+      bind(&after_pool);
+    }
   }
 
   // Since a constant pool was just emitted, move the check offset forward by
   // the standard interval.
-  next_buffer_check_ = pc_offset() + kCheckConstInterval;
+  next_buffer_check_ = pc_offset() + kCheckPoolInterval;
 }
 
 

@@ -1,4 +1,4 @@
-// Copyright 2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -27,6 +27,7 @@
 
 #include "v8.h"
 
+#include "assembler.h"
 #include "compilation-cache.h"
 #include "serialize.h"
 
@@ -52,8 +53,7 @@ CompilationCache::CompilationCache(Isolate* isolate)
       eval_global_(isolate, kEvalGlobalGenerations),
       eval_contextual_(isolate, kEvalContextualGenerations),
       reg_exp_(isolate, kRegExpGenerations),
-      enabled_(true),
-      eager_optimizing_set_(NULL) {
+      enabled_(true) {
   CompilationSubCache* subcaches[kSubCacheCount] =
     {&script_, &eval_global_, &eval_contextual_, &reg_exp_};
   for (int i = 0; i < kSubCacheCount; ++i) {
@@ -62,10 +62,7 @@ CompilationCache::CompilationCache(Isolate* isolate)
 }
 
 
-CompilationCache::~CompilationCache() {
-  delete eager_optimizing_set_;
-  eager_optimizing_set_ = NULL;
-}
+CompilationCache::~CompilationCache() {}
 
 
 static Handle<CompilationCacheTable> AllocateTable(Isolate* isolate, int size) {
@@ -254,7 +251,8 @@ void CompilationCacheScript::Put(Handle<String> source,
 Handle<SharedFunctionInfo> CompilationCacheEval::Lookup(
     Handle<String> source,
     Handle<Context> context,
-    StrictModeFlag strict_mode) {
+    LanguageMode language_mode,
+    int scope_position) {
   // Make sure not to leak the table into the surrounding handle
   // scope. Otherwise, we risk keeping old tables around even after
   // having cleared the cache.
@@ -263,7 +261,8 @@ Handle<SharedFunctionInfo> CompilationCacheEval::Lookup(
   { HandleScope scope(isolate());
     for (generation = 0; generation < generations(); generation++) {
       Handle<CompilationCacheTable> table = GetTable(generation);
-      result = table->LookupEval(*source, *context, strict_mode);
+      result = table->LookupEval(
+          *source, *context, language_mode, scope_position);
       if (result->IsSharedFunctionInfo()) {
         break;
       }
@@ -273,7 +272,7 @@ Handle<SharedFunctionInfo> CompilationCacheEval::Lookup(
     Handle<SharedFunctionInfo>
         function_info(SharedFunctionInfo::cast(result), isolate());
     if (generation != 0) {
-      Put(source, context, function_info);
+      Put(source, context, function_info, scope_position);
     }
     isolate()->counters()->compilation_cache_hits()->Increment();
     return function_info;
@@ -287,27 +286,31 @@ Handle<SharedFunctionInfo> CompilationCacheEval::Lookup(
 MaybeObject* CompilationCacheEval::TryTablePut(
     Handle<String> source,
     Handle<Context> context,
-    Handle<SharedFunctionInfo> function_info) {
+    Handle<SharedFunctionInfo> function_info,
+    int scope_position) {
   Handle<CompilationCacheTable> table = GetFirstTable();
-  return table->PutEval(*source, *context, *function_info);
+  return table->PutEval(*source, *context, *function_info, scope_position);
 }
 
 
 Handle<CompilationCacheTable> CompilationCacheEval::TablePut(
     Handle<String> source,
     Handle<Context> context,
-    Handle<SharedFunctionInfo> function_info) {
+    Handle<SharedFunctionInfo> function_info,
+    int scope_position) {
   CALL_HEAP_FUNCTION(isolate(),
-                     TryTablePut(source, context, function_info),
+                     TryTablePut(
+                         source, context, function_info, scope_position),
                      CompilationCacheTable);
 }
 
 
 void CompilationCacheEval::Put(Handle<String> source,
                                Handle<Context> context,
-                               Handle<SharedFunctionInfo> function_info) {
+                               Handle<SharedFunctionInfo> function_info,
+                               int scope_position) {
   HandleScope scope(isolate());
-  SetFirstTable(TablePut(source, context, function_info));
+  SetFirstTable(TablePut(source, context, function_info, scope_position));
 }
 
 
@@ -393,16 +396,20 @@ Handle<SharedFunctionInfo> CompilationCache::LookupEval(
     Handle<String> source,
     Handle<Context> context,
     bool is_global,
-    StrictModeFlag strict_mode) {
+    LanguageMode language_mode,
+    int scope_position) {
   if (!IsEnabled()) {
     return Handle<SharedFunctionInfo>::null();
   }
 
   Handle<SharedFunctionInfo> result;
   if (is_global) {
-    result = eval_global_.Lookup(source, context, strict_mode);
+    result = eval_global_.Lookup(
+        source, context, language_mode, scope_position);
   } else {
-    result = eval_contextual_.Lookup(source, context, strict_mode);
+    ASSERT(scope_position != RelocInfo::kNoPosition);
+    result = eval_contextual_.Lookup(
+        source, context, language_mode, scope_position);
   }
   return result;
 }
@@ -431,16 +438,18 @@ void CompilationCache::PutScript(Handle<String> source,
 void CompilationCache::PutEval(Handle<String> source,
                                Handle<Context> context,
                                bool is_global,
-                               Handle<SharedFunctionInfo> function_info) {
+                               Handle<SharedFunctionInfo> function_info,
+                               int scope_position) {
   if (!IsEnabled()) {
     return;
   }
 
   HandleScope scope(isolate());
   if (is_global) {
-    eval_global_.Put(source, context, function_info);
+    eval_global_.Put(source, context, function_info, scope_position);
   } else {
-    eval_contextual_.Put(source, context, function_info);
+    ASSERT(scope_position != RelocInfo::kNoPosition);
+    eval_contextual_.Put(source, context, function_info, scope_position);
   }
 }
 
@@ -454,47 +463,6 @@ void CompilationCache::PutRegExp(Handle<String> source,
   }
 
   reg_exp_.Put(source, flags, data);
-}
-
-
-static bool SourceHashCompare(void* key1, void* key2) {
-  return key1 == key2;
-}
-
-
-HashMap* CompilationCache::EagerOptimizingSet() {
-  if (eager_optimizing_set_ == NULL) {
-    eager_optimizing_set_ = new HashMap(&SourceHashCompare);
-  }
-  return eager_optimizing_set_;
-}
-
-
-bool CompilationCache::ShouldOptimizeEagerly(Handle<JSFunction> function) {
-  if (FLAG_opt_eagerly) return true;
-  uint32_t hash = function->SourceHash();
-  void* key = reinterpret_cast<void*>(hash);
-  return EagerOptimizingSet()->Lookup(key, hash, false) != NULL;
-}
-
-
-void CompilationCache::MarkForEagerOptimizing(Handle<JSFunction> function) {
-  uint32_t hash = function->SourceHash();
-  void* key = reinterpret_cast<void*>(hash);
-  EagerOptimizingSet()->Lookup(key, hash, true);
-}
-
-
-void CompilationCache::MarkForLazyOptimizing(Handle<JSFunction> function) {
-  uint32_t hash = function->SourceHash();
-  void* key = reinterpret_cast<void*>(hash);
-  EagerOptimizingSet()->Remove(key, hash);
-}
-
-
-void CompilationCache::ResetEagerOptimizingData() {
-  HashMap* set = EagerOptimizingSet();
-  if (set->occupancy() > 0) set->Clear();
 }
 
 

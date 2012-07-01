@@ -1,4 +1,4 @@
-// Copyright 2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -33,8 +33,8 @@
 #include "utils.h"
 #include "ast.h"
 #include "bytecodes-irregexp.h"
+#include "jsregexp.h"
 #include "interpreter-irregexp.h"
-
 
 namespace v8 {
 namespace internal {
@@ -187,12 +187,12 @@ class BacktrackStack {
 
 
 template <typename Char>
-static bool RawMatch(Isolate* isolate,
-                     const byte* code_base,
-                     Vector<const Char> subject,
-                     int* registers,
-                     int current,
-                     uint32_t current_char) {
+static RegExpImpl::IrregexpResult RawMatch(Isolate* isolate,
+                                           const byte* code_base,
+                                           Vector<const Char> subject,
+                                           int* registers,
+                                           int current,
+                                           uint32_t current_char) {
   const byte* pc = code_base;
   // BacktrackStack ensures that the memory allocated for the backtracking stack
   // is returned to the system or cached if there is no stack being cached at
@@ -211,24 +211,24 @@ static bool RawMatch(Isolate* isolate,
     switch (insn & BYTECODE_MASK) {
       BYTECODE(BREAK)
         UNREACHABLE();
-        return false;
+        return RegExpImpl::RE_FAILURE;
       BYTECODE(PUSH_CP)
         if (--backtrack_stack_space < 0) {
-          return false;  // No match on backtrack stack overflow.
+          return RegExpImpl::RE_EXCEPTION;
         }
         *backtrack_sp++ = current;
         pc += BC_PUSH_CP_LENGTH;
         break;
       BYTECODE(PUSH_BT)
         if (--backtrack_stack_space < 0) {
-          return false;  // No match on backtrack stack overflow.
+          return RegExpImpl::RE_EXCEPTION;
         }
         *backtrack_sp++ = Load32Aligned(pc + 4);
         pc += BC_PUSH_BT_LENGTH;
         break;
       BYTECODE(PUSH_REGISTER)
         if (--backtrack_stack_space < 0) {
-          return false;  // No match on backtrack stack overflow.
+          return RegExpImpl::RE_EXCEPTION;
         }
         *backtrack_sp++ = registers[insn >> BYTECODE_SHIFT];
         pc += BC_PUSH_REGISTER_LENGTH;
@@ -278,9 +278,9 @@ static bool RawMatch(Isolate* isolate,
         pc += BC_POP_REGISTER_LENGTH;
         break;
       BYTECODE(FAIL)
-        return false;
+        return RegExpImpl::RE_FAILURE;
       BYTECODE(SUCCEED)
-        return true;
+        return RegExpImpl::RE_SUCCESS;
       BYTECODE(ADVANCE_CP)
         current += insn >> BYTECODE_SHIFT;
         pc += BC_ADVANCE_CP_LENGTH;
@@ -625,18 +625,20 @@ static bool RawMatch(Isolate* isolate,
 }
 
 
-bool IrregexpInterpreter::Match(Isolate* isolate,
-                                Handle<ByteArray> code_array,
-                                Handle<String> subject,
-                                int* registers,
-                                int start_position) {
+RegExpImpl::IrregexpResult IrregexpInterpreter::Match(
+    Isolate* isolate,
+    Handle<ByteArray> code_array,
+    Handle<String> subject,
+    int* registers,
+    int start_position) {
   ASSERT(subject->IsFlat());
 
   AssertNoAllocation a;
   const byte* code_base = code_array->GetDataStartAddress();
   uc16 previous_char = '\n';
-  if (subject->IsAsciiRepresentation()) {
-    Vector<const char> subject_vector = subject->ToAsciiVector();
+  String::FlatContent subject_content = subject->GetFlatContent();
+  if (subject_content.IsAscii()) {
+    Vector<const char> subject_vector = subject_content.ToAsciiVector();
     if (start_position != 0) previous_char = subject_vector[start_position - 1];
     return RawMatch(isolate,
                     code_base,
@@ -645,7 +647,8 @@ bool IrregexpInterpreter::Match(Isolate* isolate,
                     start_position,
                     previous_char);
   } else {
-    Vector<const uc16> subject_vector = subject->ToUC16Vector();
+    ASSERT(subject_content.IsTwoByte());
+    Vector<const uc16> subject_vector = subject_content.ToUC16Vector();
     if (start_position != 0) previous_char = subject_vector[start_position - 1];
     return RawMatch(isolate,
                     code_base,

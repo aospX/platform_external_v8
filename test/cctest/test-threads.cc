@@ -63,9 +63,9 @@ enum Turn {
 static Turn turn = FILL_CACHE;
 
 
-class ThreadA: public v8::internal::Thread {
+class ThreadA : public v8::internal::Thread {
  public:
-  explicit ThreadA(i::Isolate* isolate) : Thread(isolate, "ThreadA") { }
+  ThreadA() : Thread("ThreadA") { }
   void Run() {
     v8::Locker locker;
     v8::HandleScope scope;
@@ -99,9 +99,9 @@ class ThreadA: public v8::internal::Thread {
 };
 
 
-class ThreadB: public v8::internal::Thread {
+class ThreadB : public v8::internal::Thread {
  public:
-  explicit ThreadB(i::Isolate* isolate) : Thread(isolate, "ThreadB") { }
+  ThreadB() : Thread("ThreadB") { }
   void Run() {
     do {
       {
@@ -111,7 +111,7 @@ class ThreadB: public v8::internal::Thread {
           v8::Context::Scope context_scope(v8::Context::New());
 
           // Clear the caches by forcing major GC.
-          HEAP->CollectAllGarbage(false);
+          HEAP->CollectAllGarbage(v8::internal::Heap::kNoGCFlags);
           turn = SECOND_TIME_FILL_CACHE;
           break;
         }
@@ -126,8 +126,8 @@ class ThreadB: public v8::internal::Thread {
 TEST(JSFunctionResultCachesInTwoThreads) {
   v8::V8::Initialize();
 
-  ThreadA threadA(i::Isolate::Current());
-  ThreadB threadB(i::Isolate::Current());
+  ThreadA threadA;
+  ThreadB threadB;
 
   threadA.Start();
   threadB.Start();
@@ -144,7 +144,7 @@ class ThreadIdValidationThread : public v8::internal::Thread {
                            i::List<i::ThreadId>* refs,
                            unsigned int thread_no,
                            i::Semaphore* semaphore)
-    : Thread(NULL, "ThreadRefValidationThread"),
+    : Thread("ThreadRefValidationThread"),
       refs_(refs), thread_no_(thread_no), thread_to_start_(thread_to_start),
       semaphore_(semaphore) {
   }
@@ -161,6 +161,7 @@ class ThreadIdValidationThread : public v8::internal::Thread {
     }
     semaphore_->Signal();
   }
+
  private:
   i::List<i::ThreadId>* refs_;
   int thread_no_;
@@ -188,4 +189,20 @@ TEST(ThreadIdValidation) {
   for (int i = 0; i < kNThreads; i++) {
     delete threads[i];
   }
+}
+
+
+class ThreadC : public v8::internal::Thread {
+ public:
+  ThreadC() : Thread("ThreadC") { }
+  void Run() {
+    Join();
+  }
+};
+
+
+TEST(ThreadJoinSelf) {
+  ThreadC thread;
+  thread.Start();
+  thread.Join();
 }

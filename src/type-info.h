@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,26 +28,29 @@
 #ifndef V8_TYPE_INFO_H_
 #define V8_TYPE_INFO_H_
 
+#include "allocation.h"
+#include "ast.h"
 #include "globals.h"
-#include "zone.h"
 #include "zone-inl.h"
 
 namespace v8 {
 namespace internal {
 
+const int kMaxKeyedPolymorphism = 4;
+
 //         Unknown
-//           |   |
-//           |   \--------------|
-//      Primitive             Non-primitive
-//           |   \--------|     |
-//         Number      String   |
-//         /    |         |     |
-//    Double  Integer32   |    /
-//        |      |       /    /
-//        |     Smi     /    /
-//        |      |     /    /
-//        |      |    /    /
-//        Uninitialized.--/
+//           |   \____________
+//           |                |
+//      Primitive       Non-primitive
+//           |   \_______     |
+//           |           |    |
+//        Number       String |
+//         /   \         |    |
+//    Double  Integer32  |   /
+//        |      |      /   /
+//        |     Smi    /   /
+//        |      |    / __/
+//        Uninitialized.
 
 class TypeInfo {
  public:
@@ -62,6 +65,8 @@ class TypeInfo {
   static TypeInfo Integer32() { return TypeInfo(kInteger32); }
   // We know it's a Smi.
   static TypeInfo Smi() { return TypeInfo(kSmi); }
+  // We know it's a Symbol.
+  static TypeInfo Symbol() { return TypeInfo(kSymbol); }
   // We know it's a heap number.
   static TypeInfo Double() { return TypeInfo(kDouble); }
   // We know it's a string.
@@ -70,32 +75,6 @@ class TypeInfo {
   static TypeInfo NonPrimitive() { return TypeInfo(kNonPrimitive); }
   // We haven't started collecting info yet.
   static TypeInfo Uninitialized() { return TypeInfo(kUninitialized); }
-
-  // Return compact representation.  Very sensitive to enum values below!
-  // Compacting drops information about primitive types and strings types.
-  // We use the compact representation when we only care about number types.
-  int ThreeBitRepresentation() {
-    ASSERT(type_ != kUninitialized);
-    int answer = type_ & 0xf;
-    answer = answer > 6 ? answer - 2 : answer;
-    ASSERT(answer >= 0);
-    ASSERT(answer <= 7);
-    return answer;
-  }
-
-  // Decode compact representation.  Very sensitive to enum values below!
-  static TypeInfo ExpandedRepresentation(int three_bit_representation) {
-    Type t = static_cast<Type>(three_bit_representation > 4 ?
-                               three_bit_representation + 2 :
-                               three_bit_representation);
-    t = (t == kUnknown) ? t : static_cast<Type>(t | kPrimitive);
-    ASSERT(t == kUnknown ||
-           t == kNumber ||
-           t == kInteger32 ||
-           t == kSmi ||
-           t == kDouble);
-    return TypeInfo(t);
-  }
 
   int ToInt() {
     return type_;
@@ -161,6 +140,16 @@ class TypeInfo {
     return ((type_ & kSmi) == kSmi);
   }
 
+  inline bool IsSymbol() {
+    ASSERT(type_ != kUninitialized);
+    return ((type_ & kSymbol) == kSymbol);
+  }
+
+  inline bool IsNonSymbol() {
+    ASSERT(type_ != kUninitialized);
+    return ((type_ & kSymbol) == kString);
+  }
+
   inline bool IsInteger32() {
     ASSERT(type_ != kUninitialized);
     return ((type_ & kInteger32) == kInteger32);
@@ -192,6 +181,7 @@ class TypeInfo {
       case kNumber: return "Number";
       case kInteger32: return "Integer32";
       case kSmi: return "Smi";
+      case kSymbol: return "Symbol";
       case kDouble: return "Double";
       case kString: return "String";
       case kNonPrimitive: return "Object";
@@ -210,6 +200,7 @@ class TypeInfo {
     kSmi = 0x17,           // 0010111
     kDouble = 0x19,        // 0011001
     kString = 0x30,        // 0110000
+    kSymbol = 0x32,        // 0110010
     kNonPrimitive = 0x40,  // 1000000
     kUninitialized = 0x7f  // 1111111
   };
@@ -229,58 +220,103 @@ enum StringStubFeedback {
 class Assignment;
 class BinaryOperation;
 class Call;
+class CallNew;
+class CaseClause;
 class CompareOperation;
 class CompilationInfo;
+class CountOperation;
+class Expression;
 class Property;
-class CaseClause;
+class SmallMapList;
+class UnaryOperation;
+class ForInStatement;
+
 
 class TypeFeedbackOracle BASE_EMBEDDED {
  public:
-  TypeFeedbackOracle(Handle<Code> code, Handle<Context> global_context);
+  TypeFeedbackOracle(Handle<Code> code,
+                     Handle<Context> global_context,
+                     Isolate* isolate);
 
-  bool LoadIsMonomorphic(Property* expr);
-  bool StoreIsMonomorphic(Expression* expr);
+  bool LoadIsMonomorphicNormal(Property* expr);
+  bool LoadIsUninitialized(Property* expr);
+  bool LoadIsMegamorphicWithTypeInfo(Property* expr);
+  bool StoreIsMonomorphicNormal(Expression* expr);
+  bool StoreIsMegamorphicWithTypeInfo(Expression* expr);
   bool CallIsMonomorphic(Call* expr);
+  bool CallNewIsMonomorphic(CallNew* expr);
+  bool ObjectLiteralStoreIsMonomorphic(ObjectLiteral::Property* prop);
+
+  bool IsForInFastCase(ForInStatement* expr);
 
   Handle<Map> LoadMonomorphicReceiverType(Property* expr);
   Handle<Map> StoreMonomorphicReceiverType(Expression* expr);
 
-  ZoneMapList* LoadReceiverTypes(Property* expr, Handle<String> name);
-  ZoneMapList* StoreReceiverTypes(Assignment* expr, Handle<String> name);
-  ZoneMapList* CallReceiverTypes(Call* expr, Handle<String> name);
+  void LoadReceiverTypes(Property* expr,
+                         Handle<String> name,
+                         SmallMapList* types);
+  void StoreReceiverTypes(Assignment* expr,
+                          Handle<String> name,
+                          SmallMapList* types);
+  void CallReceiverTypes(Call* expr,
+                         Handle<String> name,
+                         CallKind call_kind,
+                         SmallMapList* types);
+  void CollectKeyedReceiverTypes(unsigned ast_id,
+                                 SmallMapList* types);
 
-  ExternalArrayType GetKeyedLoadExternalArrayType(Property* expr);
-  ExternalArrayType GetKeyedStoreExternalArrayType(Expression* expr);
+  static bool CanRetainOtherContext(Map* map, Context* global_context);
+  static bool CanRetainOtherContext(JSFunction* function,
+                                    Context* global_context);
 
   CheckType GetCallCheckType(Call* expr);
   Handle<JSObject> GetPrototypeForPrimitiveCheck(CheckType check);
 
+  Handle<JSFunction> GetCallTarget(Call* expr);
+  Handle<JSFunction> GetCallNewTarget(CallNew* expr);
+
+  Handle<Map> GetObjectLiteralStoreMap(ObjectLiteral::Property* prop);
+
   bool LoadIsBuiltin(Property* expr, Builtins::Name id);
 
+  // TODO(1571) We can't use ToBooleanStub::Types as the return value because
+  // of various cylces in our headers. Death to tons of implementations in
+  // headers!! :-P
+  byte ToBooleanTypes(unsigned ast_id);
+
   // Get type information for arithmetic operations and compares.
+  TypeInfo UnaryType(UnaryOperation* expr);
   TypeInfo BinaryType(BinaryOperation* expr);
   TypeInfo CompareType(CompareOperation* expr);
+  bool IsSymbolCompare(CompareOperation* expr);
+  Handle<Map> GetCompareMap(CompareOperation* expr);
   TypeInfo SwitchType(CaseClause* clause);
+  TypeInfo IncrementType(CountOperation* expr);
 
  private:
-  ZoneMapList* CollectReceiverTypes(int position,
-                                    Handle<String> name,
-                                    Code::Flags flags);
+  void CollectReceiverTypes(unsigned ast_id,
+                            Handle<String> name,
+                            Code::Flags flags,
+                            SmallMapList* types);
 
-  void SetInfo(int position, Object* target);
+  void SetInfo(unsigned ast_id, Object* target);
 
-  void PopulateMap(Handle<Code> code);
-
-  void CollectPositions(Code* code,
-                        List<int>* code_positions,
-                        List<int>* source_positions);
+  void BuildDictionary(Handle<Code> code);
+  void GetRelocInfos(Handle<Code> code, ZoneList<RelocInfo>* infos);
+  void CreateDictionary(Handle<Code> code, ZoneList<RelocInfo>* infos);
+  void RelocateRelocInfos(ZoneList<RelocInfo>* infos,
+                          byte* old_start,
+                          byte* new_start);
+  void ProcessRelocInfos(ZoneList<RelocInfo>* infos);
+  void ProcessTypeFeedbackCells(Handle<Code> code);
 
   // Returns an element from the backing store. Returns undefined if
   // there is no information.
-  Handle<Object> GetInfo(int pos);
+  Handle<Object> GetInfo(unsigned ast_id);
 
   Handle<Context> global_context_;
-  Handle<NumberDictionary> dictionary_;
+  Isolate* isolate_;
+  Handle<UnseededNumberDictionary> dictionary_;
 
   DISALLOW_COPY_AND_ASSIGN(TypeFeedbackOracle);
 };

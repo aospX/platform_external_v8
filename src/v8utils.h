@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -142,8 +142,14 @@ inline void CopyWords(T* dst, T* src, int num_words) {
 }
 
 
-template <typename T>
-static inline void MemsetPointer(T** dest, T* value, int counter) {
+template <typename T, typename U>
+inline void MemsetPointer(T** dest, U* value, int counter) {
+#ifdef DEBUG
+  T* a = NULL;
+  U* b = NULL;
+  a = b;  // Fake assignment to check assignability.
+  USE(a);
+#endif  // DEBUG
 #if defined(V8_HOST_ARCH_IA32)
 #define STOS "stosl"
 #elif defined(V8_HOST_ARCH_X64)
@@ -188,77 +194,15 @@ class AsciiStringAdapter: public v8::String::ExternalAsciiStringResource {
 Vector<const char> ReadFile(const char* filename,
                             bool* exists,
                             bool verbose = true);
+Vector<const char> ReadFile(FILE* file,
+                            bool* exists,
+                            bool verbose = true);
 
-
-// Helper class for building result strings in a character buffer. The
-// purpose of the class is to use safe operations that checks the
-// buffer bounds on all operations in debug mode.
-class StringBuilder {
- public:
-  // Create a string builder with a buffer of the given size. The
-  // buffer is allocated through NewArray<char> and must be
-  // deallocated by the caller of Finalize().
-  explicit StringBuilder(int size);
-
-  StringBuilder(char* buffer, int size)
-      : buffer_(buffer, size), position_(0) { }
-
-  ~StringBuilder() { if (!is_finalized()) Finalize(); }
-
-  int size() const { return buffer_.length(); }
-
-  // Get the current position in the builder.
-  int position() const {
-    ASSERT(!is_finalized());
-    return position_;
-  }
-
-  // Reset the position.
-  void Reset() { position_ = 0; }
-
-  // Add a single character to the builder. It is not allowed to add
-  // 0-characters; use the Finalize() method to terminate the string
-  // instead.
-  void AddCharacter(char c) {
-    ASSERT(c != '\0');
-    ASSERT(!is_finalized() && position_ < buffer_.length());
-    buffer_[position_++] = c;
-  }
-
-  // Add an entire string to the builder. Uses strlen() internally to
-  // compute the length of the input string.
-  void AddString(const char* s);
-
-  // Add the first 'n' characters of the given string 's' to the
-  // builder. The input string must have enough characters.
-  void AddSubstring(const char* s, int n);
-
-  // Add formatted contents to the builder just like printf().
-  void AddFormatted(const char* format, ...);
-
-  // Add formatted contents like printf based on a va_list.
-  void AddFormattedList(const char* format, va_list list);
-
-  // Add character padding to the builder. If count is non-positive,
-  // nothing is added to the builder.
-  void AddPadding(char c, int count);
-
-  // Finalize the string by 0-terminating it and returning the buffer.
-  char* Finalize();
-
- private:
-  Vector<char> buffer_;
-  int position_;
-
-  bool is_finalized() const { return position_ < 0; }
-
-  DISALLOW_IMPLICIT_CONSTRUCTORS(StringBuilder);
-};
 
 
 // Copy from ASCII/16bit chars to ASCII/16bit chars.
 template <typename sourcechar, typename sinkchar>
-static inline void CopyChars(sinkchar* dest, const sourcechar* src, int chars) {
+inline void CopyChars(sinkchar* dest, const sourcechar* src, int chars) {
   sinkchar* limit = dest + chars;
 #ifdef V8_HOST_CAN_READ_UNALIGNED
   if (sizeof(*dest) == sizeof(*src)) {
@@ -313,6 +257,19 @@ class MemoryMappedExternalResource: public
   bool remove_file_on_cleanup_;
 };
 
+class StringBuilder : public SimpleStringBuilder {
+ public:
+  explicit StringBuilder(int size) : SimpleStringBuilder(size) { }
+  StringBuilder(char* buffer, int size) : SimpleStringBuilder(buffer, size) { }
+
+  // Add formatted contents to the builder just like printf().
+  void AddFormatted(const char* format, ...);
+
+  // Add formatted contents like printf based on a va_list.
+  void AddFormattedList(const char* format, va_list list);
+ private:
+  DISALLOW_IMPLICIT_CONSTRUCTORS(StringBuilder);
+};
 
 } }  // namespace v8::internal
 

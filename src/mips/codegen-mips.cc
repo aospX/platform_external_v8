@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -25,1186 +25,426 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-
 #include "v8.h"
 
 #if defined(V8_TARGET_ARCH_MIPS)
 
-#include "bootstrapper.h"
-#include "code-stubs.h"
-#include "codegen-inl.h"
-#include "compiler.h"
-#include "debug.h"
-#include "ic-inl.h"
-#include "jsregexp.h"
-#include "jump-target-inl.h"
-#include "parser.h"
-#include "regexp-macro-assembler.h"
-#include "regexp-stack.h"
-#include "register-allocator-inl.h"
-#include "runtime.h"
-#include "scopes.h"
-#include "stub-cache.h"
-#include "virtual-frame-inl.h"
-#include "virtual-frame-mips-inl.h"
+#include "codegen.h"
+#include "macro-assembler.h"
 
 namespace v8 {
 namespace internal {
 
+#define __ ACCESS_MASM(masm)
 
-#define __ ACCESS_MASM(masm_)
-
-// -------------------------------------------------------------------------
-// Platform-specific DeferredCode functions.
-
-void DeferredCode::SaveRegisters() {
-  // On MIPS you either have a completely spilled frame or you
-  // handle it yourself, but at the moment there's no automation
-  // of registers and deferred code.
+UnaryMathFunction CreateTranscendentalFunction(TranscendentalCache::Type type) {
+  switch (type) {
+    case TranscendentalCache::SIN: return &sin;
+    case TranscendentalCache::COS: return &cos;
+    case TranscendentalCache::TAN: return &tan;
+    case TranscendentalCache::LOG: return &log;
+    default: UNIMPLEMENTED();
+  }
+  return NULL;
 }
 
 
-void DeferredCode::RestoreRegisters() {
+UnaryMathFunction CreateSqrtFunction() {
+  return &sqrt;
 }
-
 
 // -------------------------------------------------------------------------
 // Platform-specific RuntimeCallHelper functions.
 
-void VirtualFrameRuntimeCallHelper::BeforeCall(MacroAssembler* masm) const {
-  frame_state_->frame()->AssertIsSpilled();
-}
-
-
-void VirtualFrameRuntimeCallHelper::AfterCall(MacroAssembler* masm) const {
-}
-
-
 void StubRuntimeCallHelper::BeforeCall(MacroAssembler* masm) const {
-  masm->EnterInternalFrame();
+  masm->EnterFrame(StackFrame::INTERNAL);
+  ASSERT(!masm->has_frame());
+  masm->set_has_frame(true);
 }
 
 
 void StubRuntimeCallHelper::AfterCall(MacroAssembler* masm) const {
-  masm->LeaveInternalFrame();
+  masm->LeaveFrame(StackFrame::INTERNAL);
+  ASSERT(masm->has_frame());
+  masm->set_has_frame(false);
+}
+
+// -------------------------------------------------------------------------
+// Code generators
+
+void ElementsTransitionGenerator::GenerateSmiOnlyToObject(
+    MacroAssembler* masm) {
+  // ----------- S t a t e -------------
+  //  -- a0    : value
+  //  -- a1    : key
+  //  -- a2    : receiver
+  //  -- ra    : return address
+  //  -- a3    : target map, scratch for subsequent call
+  //  -- t0    : scratch (elements)
+  // -----------------------------------
+  // Set transitioned map.
+  __ sw(a3, FieldMemOperand(a2, HeapObject::kMapOffset));
+  __ RecordWriteField(a2,
+                      HeapObject::kMapOffset,
+                      a3,
+                      t5,
+                      kRAHasNotBeenSaved,
+                      kDontSaveFPRegs,
+                      EMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
 }
 
 
-// -----------------------------------------------------------------------------
-// CodeGenState implementation.
+void ElementsTransitionGenerator::GenerateSmiOnlyToDouble(
+    MacroAssembler* masm, Label* fail) {
+  // ----------- S t a t e -------------
+  //  -- a0    : value
+  //  -- a1    : key
+  //  -- a2    : receiver
+  //  -- ra    : return address
+  //  -- a3    : target map, scratch for subsequent call
+  //  -- t0    : scratch (elements)
+  // -----------------------------------
+  Label loop, entry, convert_hole, gc_required, only_change_map, done;
+  bool fpu_supported = CpuFeatures::IsSupported(FPU);
 
-CodeGenState::CodeGenState(CodeGenerator* owner)
-    : owner_(owner),
-      previous_(owner->state()) {
-  owner->set_state(this);
-}
+  Register scratch = t6;
 
+  // Check for empty arrays, which only require a map transition and no changes
+  // to the backing store.
+  __ lw(t0, FieldMemOperand(a2, JSObject::kElementsOffset));
+  __ LoadRoot(at, Heap::kEmptyFixedArrayRootIndex);
+  __ Branch(&only_change_map, eq, at, Operand(t0));
 
-ConditionCodeGenState::ConditionCodeGenState(CodeGenerator* owner,
-                           JumpTarget* true_target,
-                           JumpTarget* false_target)
-    : CodeGenState(owner),
-      true_target_(true_target),
-      false_target_(false_target) {
-  owner->set_state(this);
-}
+  __ push(ra);
+  __ lw(t1, FieldMemOperand(t0, FixedArray::kLengthOffset));
+  // t0: source FixedArray
+  // t1: number of elements (smi-tagged)
 
+  // Allocate new FixedDoubleArray.
+  __ sll(scratch, t1, 2);
+  __ Addu(scratch, scratch, FixedDoubleArray::kHeaderSize);
+  __ AllocateInNewSpace(scratch, t2, t3, t5, &gc_required, NO_ALLOCATION_FLAGS);
+  // t2: destination FixedDoubleArray, not tagged as heap object
+  // Set destination FixedDoubleArray's length and map.
+  __ LoadRoot(t5, Heap::kFixedDoubleArrayMapRootIndex);
+  __ sw(t1, MemOperand(t2, FixedDoubleArray::kLengthOffset));
+  __ sw(t5, MemOperand(t2, HeapObject::kMapOffset));
+  // Update receiver's map.
 
-TypeInfoCodeGenState::TypeInfoCodeGenState(CodeGenerator* owner,
-                                           Slot* slot,
-                                           TypeInfo type_info)
-    : CodeGenState(owner),
-      slot_(slot) {
-  owner->set_state(this);
-  old_type_info_ = owner->set_type_info(slot, type_info);
-}
-
-
-CodeGenState::~CodeGenState() {
-  ASSERT(owner_->state() == this);
-  owner_->set_state(previous_);
-}
-
-
-TypeInfoCodeGenState::~TypeInfoCodeGenState() {
-  owner()->set_type_info(slot_, old_type_info_);
-}
-
-
-// -----------------------------------------------------------------------------
-// CodeGenerator implementation.
-
-CodeGenerator::CodeGenerator(MacroAssembler* masm)
-    : deferred_(8),
-      masm_(masm),
-      info_(NULL),
-      frame_(NULL),
-      allocator_(NULL),
-      cc_reg_(cc_always),
-      state_(NULL),
-      loop_nesting_(0),
-      type_info_(NULL),
-      function_return_(JumpTarget::BIDIRECTIONAL),
-      function_return_is_shadowed_(false) {
-}
-
-
-// Calling conventions:
-// fp: caller's frame pointer
-// sp: stack pointer
-// a1: called JS function
-// cp: callee's context
-
-void CodeGenerator::Generate(CompilationInfo* info) {
-  UNIMPLEMENTED_MIPS();
-}
+  __ sw(a3, FieldMemOperand(a2, HeapObject::kMapOffset));
+  __ RecordWriteField(a2,
+                      HeapObject::kMapOffset,
+                      a3,
+                      t5,
+                      kRAHasBeenSaved,
+                      kDontSaveFPRegs,
+                      OMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
+  // Replace receiver's backing store with newly created FixedDoubleArray.
+  __ Addu(a3, t2, Operand(kHeapObjectTag));
+  __ sw(a3, FieldMemOperand(a2, JSObject::kElementsOffset));
+  __ RecordWriteField(a2,
+                      JSObject::kElementsOffset,
+                      a3,
+                      t5,
+                      kRAHasBeenSaved,
+                      kDontSaveFPRegs,
+                      EMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
 
 
-int CodeGenerator::NumberOfSlot(Slot* slot) {
-  UNIMPLEMENTED_MIPS();
-  return 0;
-}
+  // Prepare for conversion loop.
+  __ Addu(a3, t0, Operand(FixedArray::kHeaderSize - kHeapObjectTag));
+  __ Addu(t3, t2, Operand(FixedDoubleArray::kHeaderSize));
+  __ sll(t2, t1, 2);
+  __ Addu(t2, t2, t3);
+  __ li(t0, Operand(kHoleNanLower32));
+  __ li(t1, Operand(kHoleNanUpper32));
+  // t0: kHoleNanLower32
+  // t1: kHoleNanUpper32
+  // t2: end of destination FixedDoubleArray, not tagged
+  // t3: begin of FixedDoubleArray element fields, not tagged
 
+  if (!fpu_supported) __ Push(a1, a0);
 
-MemOperand CodeGenerator::SlotOperand(Slot* slot, Register tmp) {
-  UNIMPLEMENTED_MIPS();
-  return MemOperand(zero_reg, 0);
-}
+  __ Branch(&entry);
 
+  __ bind(&only_change_map);
+  __ sw(a3, FieldMemOperand(a2, HeapObject::kMapOffset));
+  __ RecordWriteField(a2,
+                      HeapObject::kMapOffset,
+                      a3,
+                      t5,
+                      kRAHasBeenSaved,
+                      kDontSaveFPRegs,
+                      OMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
+  __ Branch(&done);
 
-MemOperand CodeGenerator::ContextSlotOperandCheckExtensions(
-    Slot* slot,
-    Register tmp,
-    Register tmp2,
-    JumpTarget* slow) {
-  UNIMPLEMENTED_MIPS();
-  return MemOperand(zero_reg, 0);
-}
+  // Call into runtime if GC is required.
+  __ bind(&gc_required);
+  __ pop(ra);
+  __ Branch(fail);
 
+  // Convert and copy elements.
+  __ bind(&loop);
+  __ lw(t5, MemOperand(a3));
+  __ Addu(a3, a3, kIntSize);
+  // t5: current element
+  __ UntagAndJumpIfNotSmi(t5, t5, &convert_hole);
 
-void CodeGenerator::LoadCondition(Expression* x,
-                                  JumpTarget* true_target,
-                                  JumpTarget* false_target,
-                                  bool force_cc) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::Load(Expression* x) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadGlobal() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadGlobalReceiver(Register scratch) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-ArgumentsAllocationMode CodeGenerator::ArgumentsMode() {
-  UNIMPLEMENTED_MIPS();
-  return EAGER_ARGUMENTS_ALLOCATION;
-}
-
-
-void CodeGenerator::StoreArgumentsObject(bool initial) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadTypeofExpression(Expression* x) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-Reference::Reference(CodeGenerator* cgen,
-                     Expression* expression,
-                     bool persist_after_get)
-    : cgen_(cgen),
-      expression_(expression),
-      type_(ILLEGAL),
-      persist_after_get_(persist_after_get) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-Reference::~Reference() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadReference(Reference* ref) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::UnloadReference(Reference* ref) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-// ECMA-262, section 9.2, page 30: ToBoolean(). Convert the given
-// register to a boolean in the condition code register. The code
-// may jump to 'false_target' in case the register converts to 'false'.
-void CodeGenerator::ToBoolean(JumpTarget* true_target,
-                              JumpTarget* false_target) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenericBinaryOperation(Token::Value op,
-                                           OverwriteMode overwrite_mode,
-                                           GenerateInlineSmi inline_smi,
-                                           int constant_rhs) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredInlineSmiOperation: public DeferredCode {
- public:
-  DeferredInlineSmiOperation(Token::Value op,
-                             int value,
-                             bool reversed,
-                             OverwriteMode overwrite_mode,
-                             Register tos)
-      : op_(op),
-        value_(value),
-        reversed_(reversed),
-        overwrite_mode_(overwrite_mode),
-        tos_register_(tos) {
-    set_comment("[ DeferredInlinedSmiOperation");
+  // Normal smi, convert to double and store.
+  if (fpu_supported) {
+    CpuFeatures::Scope scope(FPU);
+    __ mtc1(t5, f0);
+    __ cvt_d_w(f0, f0);
+    __ sdc1(f0, MemOperand(t3));
+    __ Addu(t3, t3, kDoubleSize);
+  } else {
+    FloatingPointHelper::ConvertIntToDouble(masm,
+                                            t5,
+                                            FloatingPointHelper::kCoreRegisters,
+                                            f0,
+                                            a0,
+                                            a1,
+                                            t7,
+                                            f0);
+    __ sw(a0, MemOperand(t3));  // mantissa
+    __ sw(a1, MemOperand(t3, kIntSize));  // exponent
+    __ Addu(t3, t3, kDoubleSize);
   }
-
-  virtual void Generate();
-  // This stub makes explicit calls to SaveRegisters(), RestoreRegisters() and
-  // Exit(). Currently on MIPS SaveRegisters() and RestoreRegisters() are empty
-  // methods, it is the responsibility of the deferred code to save and restore
-  // registers.
-  virtual bool AutoSaveAndRestore() { return false; }
-
-  void JumpToNonSmiInput(Condition cond, Register cmp1, const Operand& cmp2);
-  void JumpToAnswerOutOfRange(Condition cond,
-                              Register cmp1,
-                              const Operand& cmp2);
-
- private:
-  void GenerateNonSmiInput();
-  void GenerateAnswerOutOfRange();
-  void WriteNonSmiAnswer(Register answer,
-                         Register heap_number,
-                         Register scratch);
-
-  Token::Value op_;
-  int value_;
-  bool reversed_;
-  OverwriteMode overwrite_mode_;
-  Register tos_register_;
-  Label non_smi_input_;
-  Label answer_out_of_range_;
-};
-
-
-// For bit operations we try harder and handle the case where the input is not
-// a Smi but a 32bits integer without calling the generic stub.
-void DeferredInlineSmiOperation::JumpToNonSmiInput(Condition cond,
-                                                   Register cmp1,
-                                                   const Operand& cmp2) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-// For bit operations the result is always 32bits so we handle the case where
-// the result does not fit in a Smi without calling the generic stub.
-void DeferredInlineSmiOperation::JumpToAnswerOutOfRange(Condition cond,
-                                                        Register cmp1,
-                                                        const Operand& cmp2) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-// On entry the non-constant side of the binary operation is in tos_register_
-// and the constant smi side is nowhere.  The tos_register_ is not used by the
-// virtual frame.  On exit the answer is in the tos_register_ and the virtual
-// frame is unchanged.
-void DeferredInlineSmiOperation::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-// Convert and write the integer answer into heap_number.
-void DeferredInlineSmiOperation::WriteNonSmiAnswer(Register answer,
-                                                   Register heap_number,
-                                                   Register scratch) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void DeferredInlineSmiOperation::GenerateNonSmiInput() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void DeferredInlineSmiOperation::GenerateAnswerOutOfRange() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::SmiOperation(Token::Value op,
-                                 Handle<Object> value,
-                                 bool reversed,
-                                 OverwriteMode mode) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-// On MIPS we load registers condReg1 and condReg2 with the values which should
-// be compared. With the CodeGenerator::cc_reg_ condition, functions will be
-// able to evaluate correctly the condition. (eg CodeGenerator::Branch)
-void CodeGenerator::Comparison(Condition cc,
-                               Expression* left,
-                               Expression* right,
-                               bool strict) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::CallWithArguments(ZoneList<Expression*>* args,
-                                      CallFunctionFlags flags,
-                                      int position) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::CallApplyLazy(Expression* applicand,
-                                  Expression* receiver,
-                                  VariableProxy* arguments,
-                                  int position) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::Branch(bool if_true, JumpTarget* target) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::CheckStack() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitStatements(ZoneList<Statement*>* statements) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitBlock(Block* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::DeclareGlobals(Handle<FixedArray> pairs) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitDeclaration(Declaration* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitExpressionStatement(ExpressionStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitEmptyStatement(EmptyStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitIfStatement(IfStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitContinueStatement(ContinueStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitBreakStatement(BreakStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitReturnStatement(ReturnStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateReturnSequence() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitWithEnterStatement(WithEnterStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitWithExitStatement(WithExitStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitSwitchStatement(SwitchStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitDoWhileStatement(DoWhileStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitWhileStatement(WhileStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitForStatement(ForStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitForInStatement(ForInStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitTryCatchStatement(TryCatchStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitTryFinallyStatement(TryFinallyStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitDebuggerStatement(DebuggerStatement* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::InstantiateFunction(
-    Handle<SharedFunctionInfo> function_info,
-    bool pretenure) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitFunctionLiteral(FunctionLiteral* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitSharedFunctionInfoLiteral(
-    SharedFunctionInfoLiteral* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitConditional(Conditional* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadFromSlot(Slot* slot, TypeofState typeof_state) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadFromSlotCheckForArguments(Slot* slot,
-                                                  TypeofState state) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::StoreToSlot(Slot* slot, InitState init_state) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::LoadFromGlobalSlotCheckExtensions(Slot* slot,
-                                                      TypeofState typeof_state,
-                                                      JumpTarget* slow) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitDynamicLoadFromSlotFastCase(Slot* slot,
-                                                    TypeofState typeof_state,
-                                                    JumpTarget* slow,
-                                                    JumpTarget* done) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitSlot(Slot* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitVariableProxy(VariableProxy* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitLiteral(Literal* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitRegExpLiteral(RegExpLiteral* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitObjectLiteral(ObjectLiteral* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitArrayLiteral(ArrayLiteral* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCatchExtensionObject(CatchExtensionObject* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitSlotAssignment(Assignment* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitNamedPropertyAssignment(Assignment* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitKeyedPropertyAssignment(Assignment* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitAssignment(Assignment* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitThrow(Throw* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitProperty(Property* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCall(Call* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCallNew(CallNew* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateClassOf(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateValueOf(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateSetValueOf(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsSmi(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateLog(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsNonNegativeSmi(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateMathPow(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateMathSqrt(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredStringCharCodeAt : public DeferredCode {
- public:
-  DeferredStringCharCodeAt(Register object,
-                           Register index,
-                           Register scratch,
-                           Register result)
-      : result_(result),
-        char_code_at_generator_(object,
-                                index,
-                                scratch,
-                                result,
-                                &need_conversion_,
-                                &need_conversion_,
-                                &index_out_of_range_,
-                                STRING_INDEX_IS_NUMBER) {}
-
-  StringCharCodeAtGenerator* fast_case_generator() {
-    return &char_code_at_generator_;
+  __ Branch(&entry);
+
+  // Hole found, store the-hole NaN.
+  __ bind(&convert_hole);
+  if (FLAG_debug_code) {
+    // Restore a "smi-untagged" heap object.
+    __ SmiTag(t5);
+    __ Or(t5, t5, Operand(1));
+    __ LoadRoot(at, Heap::kTheHoleValueRootIndex);
+    __ Assert(eq, "object found in smi-only array", at, Operand(t5));
   }
+  __ sw(t0, MemOperand(t3));  // mantissa
+  __ sw(t1, MemOperand(t3, kIntSize));  // exponent
+  __ Addu(t3, t3, kDoubleSize);
 
-  virtual void Generate() {
-    UNIMPLEMENTED_MIPS();
+  __ bind(&entry);
+  __ Branch(&loop, lt, t3, Operand(t2));
+
+  if (!fpu_supported) __ Pop(a1, a0);
+  __ pop(ra);
+  __ bind(&done);
+}
+
+
+void ElementsTransitionGenerator::GenerateDoubleToObject(
+    MacroAssembler* masm, Label* fail) {
+  // ----------- S t a t e -------------
+  //  -- a0    : value
+  //  -- a1    : key
+  //  -- a2    : receiver
+  //  -- ra    : return address
+  //  -- a3    : target map, scratch for subsequent call
+  //  -- t0    : scratch (elements)
+  // -----------------------------------
+  Label entry, loop, convert_hole, gc_required, only_change_map;
+
+  // Check for empty arrays, which only require a map transition and no changes
+  // to the backing store.
+  __ lw(t0, FieldMemOperand(a2, JSObject::kElementsOffset));
+  __ LoadRoot(at, Heap::kEmptyFixedArrayRootIndex);
+  __ Branch(&only_change_map, eq, at, Operand(t0));
+
+  __ MultiPush(a0.bit() | a1.bit() | a2.bit() | a3.bit() | ra.bit());
+
+  __ lw(t1, FieldMemOperand(t0, FixedArray::kLengthOffset));
+  // t0: source FixedArray
+  // t1: number of elements (smi-tagged)
+
+  // Allocate new FixedArray.
+  __ sll(a0, t1, 1);
+  __ Addu(a0, a0, FixedDoubleArray::kHeaderSize);
+  __ AllocateInNewSpace(a0, t2, t3, t5, &gc_required, NO_ALLOCATION_FLAGS);
+  // t2: destination FixedArray, not tagged as heap object
+  // Set destination FixedDoubleArray's length and map.
+  __ LoadRoot(t5, Heap::kFixedArrayMapRootIndex);
+  __ sw(t1, MemOperand(t2, FixedDoubleArray::kLengthOffset));
+  __ sw(t5, MemOperand(t2, HeapObject::kMapOffset));
+
+  // Prepare for conversion loop.
+  __ Addu(t0, t0, Operand(FixedDoubleArray::kHeaderSize - kHeapObjectTag + 4));
+  __ Addu(a3, t2, Operand(FixedArray::kHeaderSize));
+  __ Addu(t2, t2, Operand(kHeapObjectTag));
+  __ sll(t1, t1, 1);
+  __ Addu(t1, a3, t1);
+  __ LoadRoot(t3, Heap::kTheHoleValueRootIndex);
+  __ LoadRoot(t5, Heap::kHeapNumberMapRootIndex);
+  // Using offsetted addresses.
+  // a3: begin of destination FixedArray element fields, not tagged
+  // t0: begin of source FixedDoubleArray element fields, not tagged, +4
+  // t1: end of destination FixedArray, not tagged
+  // t2: destination FixedArray
+  // t3: the-hole pointer
+  // t5: heap number map
+  __ Branch(&entry);
+
+  // Call into runtime if GC is required.
+  __ bind(&gc_required);
+  __ MultiPop(a0.bit() | a1.bit() | a2.bit() | a3.bit() | ra.bit());
+
+  __ Branch(fail);
+
+  __ bind(&loop);
+  __ lw(a1, MemOperand(t0));
+  __ Addu(t0, t0, kDoubleSize);
+  // a1: current element's upper 32 bit
+  // t0: address of next element's upper 32 bit
+  __ Branch(&convert_hole, eq, a1, Operand(kHoleNanUpper32));
+
+  // Non-hole double, copy value into a heap number.
+  __ AllocateHeapNumber(a2, a0, t6, t5, &gc_required);
+  // a2: new heap number
+  __ lw(a0, MemOperand(t0, -12));
+  __ sw(a0, FieldMemOperand(a2, HeapNumber::kMantissaOffset));
+  __ sw(a1, FieldMemOperand(a2, HeapNumber::kExponentOffset));
+  __ mov(a0, a3);
+  __ sw(a2, MemOperand(a3));
+  __ Addu(a3, a3, kIntSize);
+  __ RecordWrite(t2,
+                 a0,
+                 a2,
+                 kRAHasBeenSaved,
+                 kDontSaveFPRegs,
+                 EMIT_REMEMBERED_SET,
+                 OMIT_SMI_CHECK);
+  __ Branch(&entry);
+
+  // Replace the-hole NaN with the-hole pointer.
+  __ bind(&convert_hole);
+  __ sw(t3, MemOperand(a3));
+  __ Addu(a3, a3, kIntSize);
+
+  __ bind(&entry);
+  __ Branch(&loop, lt, a3, Operand(t1));
+
+  __ MultiPop(a2.bit() | a3.bit() | a0.bit() | a1.bit());
+  // Replace receiver's backing store with newly created and filled FixedArray.
+  __ sw(t2, FieldMemOperand(a2, JSObject::kElementsOffset));
+  __ RecordWriteField(a2,
+                      JSObject::kElementsOffset,
+                      t2,
+                      t5,
+                      kRAHasBeenSaved,
+                      kDontSaveFPRegs,
+                      EMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
+  __ pop(ra);
+
+  __ bind(&only_change_map);
+  // Update receiver's map.
+  __ sw(a3, FieldMemOperand(a2, HeapObject::kMapOffset));
+  __ RecordWriteField(a2,
+                      HeapObject::kMapOffset,
+                      a3,
+                      t5,
+                      kRAHasNotBeenSaved,
+                      kDontSaveFPRegs,
+                      OMIT_REMEMBERED_SET,
+                      OMIT_SMI_CHECK);
+}
+
+
+void StringCharLoadGenerator::Generate(MacroAssembler* masm,
+                                       Register string,
+                                       Register index,
+                                       Register result,
+                                       Label* call_runtime) {
+  // Fetch the instance type of the receiver into result register.
+  __ lw(result, FieldMemOperand(string, HeapObject::kMapOffset));
+  __ lbu(result, FieldMemOperand(result, Map::kInstanceTypeOffset));
+
+  // We need special handling for indirect strings.
+  Label check_sequential;
+  __ And(at, result, Operand(kIsIndirectStringMask));
+  __ Branch(&check_sequential, eq, at, Operand(zero_reg));
+
+  // Dispatch on the indirect string shape: slice or cons.
+  Label cons_string;
+  __ And(at, result, Operand(kSlicedNotConsMask));
+  __ Branch(&cons_string, eq, at, Operand(zero_reg));
+
+  // Handle slices.
+  Label indirect_string_loaded;
+  __ lw(result, FieldMemOperand(string, SlicedString::kOffsetOffset));
+  __ lw(string, FieldMemOperand(string, SlicedString::kParentOffset));
+  __ sra(at, result, kSmiTagSize);
+  __ Addu(index, index, at);
+  __ jmp(&indirect_string_loaded);
+
+  // Handle cons strings.
+  // Check whether the right hand side is the empty string (i.e. if
+  // this is really a flat string in a cons string). If that is not
+  // the case we would rather go to the runtime system now to flatten
+  // the string.
+  __ bind(&cons_string);
+  __ lw(result, FieldMemOperand(string, ConsString::kSecondOffset));
+  __ LoadRoot(at, Heap::kEmptyStringRootIndex);
+  __ Branch(call_runtime, ne, result, Operand(at));
+  // Get the first of the two strings and load its instance type.
+  __ lw(string, FieldMemOperand(string, ConsString::kFirstOffset));
+
+  __ bind(&indirect_string_loaded);
+  __ lw(result, FieldMemOperand(string, HeapObject::kMapOffset));
+  __ lbu(result, FieldMemOperand(result, Map::kInstanceTypeOffset));
+
+  // Distinguish sequential and external strings. Only these two string
+  // representations can reach here (slices and flat cons strings have been
+  // reduced to the underlying sequential or external string).
+  Label external_string, check_encoding;
+  __ bind(&check_sequential);
+  STATIC_ASSERT(kSeqStringTag == 0);
+  __ And(at, result, Operand(kStringRepresentationMask));
+  __ Branch(&external_string, ne, at, Operand(zero_reg));
+
+  // Prepare sequential strings
+  STATIC_ASSERT(SeqTwoByteString::kHeaderSize == SeqAsciiString::kHeaderSize);
+  __ Addu(string,
+          string,
+          SeqTwoByteString::kHeaderSize - kHeapObjectTag);
+  __ jmp(&check_encoding);
+
+  // Handle external strings.
+  __ bind(&external_string);
+  if (FLAG_debug_code) {
+    // Assert that we do not have a cons or slice (indirect strings) here.
+    // Sequential strings have already been ruled out.
+    __ And(at, result, Operand(kIsIndirectStringMask));
+    __ Assert(eq, "external string expected, but not found",
+        at, Operand(zero_reg));
   }
+  // Rule out short external strings.
+  STATIC_CHECK(kShortExternalStringTag != 0);
+  __ And(at, result, Operand(kShortExternalStringMask));
+  __ Branch(call_runtime, ne, at, Operand(zero_reg));
+  __ lw(string, FieldMemOperand(string, ExternalString::kResourceDataOffset));
 
- private:
-  Register result_;
-
-  Label need_conversion_;
-  Label index_out_of_range_;
-
-  StringCharCodeAtGenerator char_code_at_generator_;
-};
-
-
-void CodeGenerator::GenerateStringCharCodeAt(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
+  Label ascii, done;
+  __ bind(&check_encoding);
+  STATIC_ASSERT(kTwoByteStringTag == 0);
+  __ And(at, result, Operand(kStringEncodingMask));
+  __ Branch(&ascii, ne, at, Operand(zero_reg));
+  // Two-byte string.
+  __ sll(at, index, 1);
+  __ Addu(at, string, at);
+  __ lhu(result, MemOperand(at));
+  __ jmp(&done);
+  __ bind(&ascii);
+  // Ascii string.
+  __ Addu(at, string, index);
+  __ lbu(result, MemOperand(at));
+  __ bind(&done);
 }
-
-
-class DeferredStringCharFromCode : public DeferredCode {
- public:
-  DeferredStringCharFromCode(Register code,
-                             Register result)
-      : char_from_code_generator_(code, result) {}
-
-  StringCharFromCodeGenerator* fast_case_generator() {
-    return &char_from_code_generator_;
-  }
-
-  virtual void Generate() {
-    VirtualFrameRuntimeCallHelper call_helper(frame_state());
-    char_from_code_generator_.GenerateSlow(masm(), call_helper);
-  }
-
- private:
-  StringCharFromCodeGenerator char_from_code_generator_;
-};
-
-
-void CodeGenerator::GenerateStringCharFromCode(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredStringCharAt : public DeferredCode {
- public:
-  DeferredStringCharAt(Register object,
-                       Register index,
-                       Register scratch1,
-                       Register scratch2,
-                       Register result)
-      : result_(result),
-        char_at_generator_(object,
-                           index,
-                           scratch1,
-                           scratch2,
-                           result,
-                           &need_conversion_,
-                           &need_conversion_,
-                           &index_out_of_range_,
-                           STRING_INDEX_IS_NUMBER) {}
-
-  StringCharAtGenerator* fast_case_generator() {
-    return &char_at_generator_;
-  }
-
-  virtual void Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
- private:
-  Register result_;
-
-  Label need_conversion_;
-  Label index_out_of_range_;
-
-  StringCharAtGenerator char_at_generator_;
-};
-
-
-void CodeGenerator::GenerateStringCharAt(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsArray(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsRegExp(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsObject(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsSpecObject(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredIsStringWrapperSafeForDefaultValueOf : public DeferredCode {
- public:
-  DeferredIsStringWrapperSafeForDefaultValueOf(Register object,
-                                               Register map_result,
-                                               Register scratch1,
-                                               Register scratch2)
-      : object_(object),
-        map_result_(map_result),
-        scratch1_(scratch1),
-        scratch2_(scratch2) { }
-
-  virtual void Generate() {
-    UNIMPLEMENTED_MIPS();
-  }
-
- private:
-  Register object_;
-  Register map_result_;
-  Register scratch1_;
-  Register scratch2_;
-};
-
-
-void CodeGenerator::GenerateIsStringWrapperSafeForDefaultValueOf(
-    ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsFunction(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsUndetectableObject(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsConstructCall(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateArgumentsLength(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateArguments(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateRandomHeapNumber(
-    ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateStringAdd(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateSubString(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateStringCompare(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateRegExpExec(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateRegExpConstructResult(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredSearchCache: public DeferredCode {
- public:
-  DeferredSearchCache(Register dst, Register cache, Register key)
-      : dst_(dst), cache_(cache), key_(key) {
-    set_comment("[ DeferredSearchCache");
-  }
-
-  virtual void Generate();
-
- private:
-  Register dst_, cache_, key_;
-};
-
-
-void DeferredSearchCache::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateGetFromCache(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateNumberToString(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredSwapElements: public DeferredCode {
- public:
-  DeferredSwapElements(Register object, Register index1, Register index2)
-      : object_(object), index1_(index1), index2_(index2) {
-    set_comment("[ DeferredSwapElements");
-  }
-
-  virtual void Generate();
-
- private:
-  Register object_, index1_, index2_;
-};
-
-
-void DeferredSwapElements::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateSwapElements(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateCallFunction(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateMathSin(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateMathCos(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateMathLog(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateObjectEquals(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateIsRegExpEquivalent(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateHasCachedArrayIndex(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateGetCachedArrayIndex(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateFastAsciiArrayJoin(ZoneList<Expression*>* args) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCallRuntime(CallRuntime* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitUnaryOperation(UnaryOperation* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredCountOperation: public DeferredCode {
- public:
-  DeferredCountOperation(Register value,
-                         bool is_increment,
-                         bool is_postfix,
-                         int target_size)
-      : value_(value),
-        is_increment_(is_increment),
-        is_postfix_(is_postfix),
-        target_size_(target_size) {}
-
-  virtual void Generate() {
-    UNIMPLEMENTED_MIPS();
-  }
-
- private:
-  Register value_;
-  bool is_increment_;
-  bool is_postfix_;
-  int target_size_;
-};
-
-
-void CodeGenerator::VisitCountOperation(CountOperation* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::GenerateLogicalBooleanOperation(BinaryOperation* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitBinaryOperation(BinaryOperation* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitThisFunction(ThisFunction* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCompareOperation(CompareOperation* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::VisitCompareToNull(CompareToNull* node) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredReferenceGetNamedValue: public DeferredCode {
- public:
-  explicit DeferredReferenceGetNamedValue(Register receiver,
-                                          Handle<String> name,
-                                          bool is_contextual)
-      : receiver_(receiver),
-        name_(name),
-        is_contextual_(is_contextual),
-        is_dont_delete_(false) {
-    set_comment(is_contextual
-                ? "[ DeferredReferenceGetNamedValue (contextual)"
-                : "[ DeferredReferenceGetNamedValue");
-  }
-
-  virtual void Generate();
-
-  void set_is_dont_delete(bool value) {
-    ASSERT(is_contextual_);
-    is_dont_delete_ = value;
-  }
-
- private:
-  Register receiver_;
-  Handle<String> name_;
-  bool is_contextual_;
-  bool is_dont_delete_;
-};
-
-
-
-void DeferredReferenceGetNamedValue::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredReferenceGetKeyedValue: public DeferredCode {
- public:
-  DeferredReferenceGetKeyedValue(Register key, Register receiver)
-      : key_(key), receiver_(receiver) {
-    set_comment("[ DeferredReferenceGetKeyedValue");
-  }
-
-  virtual void Generate();
-
- private:
-  Register key_;
-  Register receiver_;
-};
-
-
-void DeferredReferenceGetKeyedValue::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredReferenceSetKeyedValue: public DeferredCode {
- public:
-  DeferredReferenceSetKeyedValue(Register value,
-                                 Register key,
-                                 Register receiver)
-      : value_(value), key_(key), receiver_(receiver) {
-    set_comment("[ DeferredReferenceSetKeyedValue");
-  }
-
-  virtual void Generate();
-
- private:
-  Register value_;
-  Register key_;
-  Register receiver_;
-};
-
-
-void DeferredReferenceSetKeyedValue::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-class DeferredReferenceSetNamedValue: public DeferredCode {
- public:
-  DeferredReferenceSetNamedValue(Register value,
-                                 Register receiver,
-                                 Handle<String> name)
-      : value_(value), receiver_(receiver), name_(name) {
-    set_comment("[ DeferredReferenceSetNamedValue");
-  }
-
-  virtual void Generate();
-
- private:
-  Register value_;
-  Register receiver_;
-  Handle<String> name_;
-};
-
-
-void DeferredReferenceSetNamedValue::Generate() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitNamedLoad(Handle<String> name, bool is_contextual) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitNamedStore(Handle<String> name, bool is_contextual) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitKeyedLoad() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void CodeGenerator::EmitKeyedStore(StaticType* key_type,
-                                   WriteBarrierCharacter wb_info) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-#ifdef DEBUG
-bool CodeGenerator::HasValidEntryRegisters() {
-  UNIMPLEMENTED_MIPS();
-  return false;
-}
-#endif
-
-
-#undef __
-#define __ ACCESS_MASM(masm)
-
-// -----------------------------------------------------------------------------
-// Reference support.
-
-
-Handle<String> Reference::GetName() {
-  UNIMPLEMENTED_MIPS();
-  return Handle<String>();
-}
-
-
-void Reference::DupIfPersist() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void Reference::GetValue() {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-void Reference::SetValue(InitState init_state, WriteBarrierCharacter wb_info) {
-  UNIMPLEMENTED_MIPS();
-}
-
-
-const char* GenericBinaryOpStub::GetName() {
-  UNIMPLEMENTED_MIPS();
-  return name_;
-}
-
 
 #undef __
 

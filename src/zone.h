@@ -1,4 +1,4 @@
-// Copyright 2011 the V8 project authors. All rights reserved.
+// Copyright 2012 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,6 +28,13 @@
 #ifndef V8_ZONE_H_
 #define V8_ZONE_H_
 
+#include "allocation.h"
+#include "checks.h"
+#include "hashmap.h"
+#include "globals.h"
+#include "list.h"
+#include "splay-tree.h"
+
 namespace v8 {
 namespace internal {
 
@@ -40,6 +47,7 @@ enum ZoneScopeMode {
 };
 
 class Segment;
+class Isolate;
 
 // The Zone supports very fast allocation of small chunks of
 // memory. The chunks cannot be deallocated individually, but instead
@@ -63,8 +71,12 @@ class Zone {
   template <typename T>
   inline T* NewArray(int length);
 
-  // Delete all objects and free all memory allocated in the Zone.
+  // Deletes all objects and free all memory allocated in the Zone. Keeps one
+  // small (size <= kMaximumKeptSegmentSize) segment around if it finds one.
   void DeleteAll();
+
+  // Deletes the last small segment kept around by DeleteAll().
+  void DeleteKeptSegment();
 
   // Returns true if more memory has been allocated in zones than
   // the limit allows.
@@ -72,13 +84,17 @@ class Zone {
 
   inline void adjust_segment_bytes_allocated(int delta);
 
+  inline Isolate* isolate() { return isolate_; }
+
   static unsigned allocation_size_;
 
  private:
   friend class Isolate;
   friend class ZoneScope;
 
-  // All pointers returned from New() have this alignment.
+  // All pointers returned from New() have this alignment.  In addition, if the
+  // object being allocated has a size that is divisible by 8 then its alignment
+  // will be 8.
   static const int kAlignment = kPointerSize;
 
   // Never allocate segments smaller than this size in bytes.
@@ -132,8 +148,8 @@ class Zone {
 class ZoneObject {
  public:
   // Allocate a new ZoneObject of 'size' bytes in the Zone.
-  inline void* operator new(size_t size);
-  inline void* operator new(size_t size, Zone* zone);
+  INLINE(void* operator new(size_t size));
+  INLINE(void* operator new(size_t size, Zone* zone));
 
   // Ideally, the delete operator should be private instead of
   // public, but unfortunately the compiler sometimes synthesizes
@@ -144,15 +160,7 @@ class ZoneObject {
   // ZoneObjects should never be deleted individually; use
   // Zone::DeleteAll() to delete all zone objects in one go.
   void operator delete(void*, size_t) { UNREACHABLE(); }
-};
-
-
-class AssertNoZoneAllocation {
- public:
-  inline AssertNoZoneAllocation();
-  inline ~AssertNoZoneAllocation();
- private:
-  bool prev_;
+  void operator delete(void* pointer, Zone* zone) { UNREACHABLE(); }
 };
 
 
@@ -162,7 +170,7 @@ class AssertNoZoneAllocation {
 class ZoneListAllocationPolicy {
  public:
   // Allocate 'size' bytes of memory in the zone.
-  static inline void* New(int size);
+  static void* New(int size);
 
   // De-allocation attempts are silently ignored.
   static void Delete(void* p) { }
@@ -176,6 +184,9 @@ class ZoneListAllocationPolicy {
 template<typename T>
 class ZoneList: public List<T, ZoneListAllocationPolicy> {
  public:
+  INLINE(void* operator new(size_t size));
+  INLINE(void* operator new(size_t size, Zone* zone));
+
   // Construct a new ZoneList with the given capacity; the length is
   // always zero. The capacity must be non-negative.
   explicit ZoneList(int capacity)
@@ -186,11 +197,10 @@ class ZoneList: public List<T, ZoneListAllocationPolicy> {
       : List<T, ZoneListAllocationPolicy>(other.length()) {
     AddAll(other);
   }
+
+  void operator delete(void* pointer) { UNREACHABLE(); }
+  void operator delete(void* pointer, Zone* zone) { UNREACHABLE(); }
 };
-
-
-// Introduce a convenience type for zone lists of map handles.
-typedef ZoneList<Handle<Map> > ZoneMapList;
 
 
 // ZoneScopes keep track of the current parsing and compilation
@@ -198,8 +208,7 @@ typedef ZoneList<Handle<Map> > ZoneMapList;
 // outer-most scope.
 class ZoneScope BASE_EMBEDDED {
  public:
-  // TODO(isolates): pass isolate pointer here.
-  inline explicit ZoneScope(ZoneScopeMode mode);
+  INLINE(ZoneScope(Isolate* isolate, ZoneScopeMode mode));
 
   virtual ~ZoneScope();
 
@@ -230,6 +239,8 @@ class ZoneSplayTree: public SplayTree<Config, ZoneListAllocationPolicy> {
   ~ZoneSplayTree();
 };
 
+
+typedef TemplateHashMapImpl<ZoneListAllocationPolicy> ZoneHashMap;
 
 } }  // namespace v8::internal
 

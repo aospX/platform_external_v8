@@ -1,4 +1,4 @@
-// Copyright 2010 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -107,7 +107,10 @@ namespace internal {
   SC(contexts_created_by_snapshot, V8.ContextsCreatedBySnapshot)      \
   /* Number of code objects found from pc. */                         \
   SC(pc_to_code, V8.PcToCode)                                         \
-  SC(pc_to_code_cached, V8.PcToCodeCached)
+  SC(pc_to_code_cached, V8.PcToCodeCached)                            \
+  /* The store-buffer implementation of the write barrier. */         \
+  SC(store_buffer_compactions, V8.StoreBufferCompactions)             \
+  SC(store_buffer_overflows, V8.StoreBufferOverflows)
 
 
 #define STATS_COUNTER_LIST_2(SC)                                      \
@@ -126,14 +129,12 @@ namespace internal {
      V8.GCCompactorCausedByWeakHandles)                               \
   SC(gc_last_resort_from_js, V8.GCLastResortFromJS)                   \
   SC(gc_last_resort_from_handles, V8.GCLastResortFromHandles)         \
-  SC(map_slow_to_fast_elements, V8.MapSlowToFastElements)             \
-  SC(map_fast_to_slow_elements, V8.MapFastToSlowElements)             \
-  SC(map_to_external_array_elements, V8.MapToExternalArrayElements)   \
   /* How is the generic keyed-load stub used? */                      \
   SC(keyed_load_generic_smi, V8.KeyedLoadGenericSmi)                  \
   SC(keyed_load_generic_symbol, V8.KeyedLoadGenericSymbol)            \
   SC(keyed_load_generic_lookup_cache, V8.KeyedLoadGenericLookupCache) \
   SC(keyed_load_generic_slow, V8.KeyedLoadGenericSlow)                \
+  SC(keyed_load_polymorphic_stubs, V8.KeyedLoadPolymorphicStubs)      \
   SC(keyed_load_external_array_slow, V8.KeyedLoadExternalArraySlow)   \
   /* How is the generic keyed-call stub used? */                      \
   SC(keyed_call_generic_smi_fast, V8.KeyedCallGenericSmiFast)         \
@@ -168,17 +169,15 @@ namespace internal {
   SC(named_load_inline_field, V8.NamedLoadInlineFast)                 \
   SC(keyed_load_inline_generic, V8.KeyedLoadInlineGeneric)            \
   SC(keyed_load_inline_fast, V8.KeyedLoadInlineFast)                  \
-  SC(named_load_full, V8.NamedLoadFull)                               \
-  SC(keyed_load_full, V8.KeyedLoadFull)                               \
   SC(keyed_store_inline_generic, V8.KeyedStoreInlineGeneric)          \
   SC(keyed_store_inline_fast, V8.KeyedStoreInlineFast)                \
   SC(named_store_inline_generic, V8.NamedStoreInlineGeneric)          \
   SC(named_store_inline_fast, V8.NamedStoreInlineFast)                \
-  SC(keyed_store_full, V8.KeyedStoreFull)                             \
-  SC(named_store_full, V8.NamedStoreFull)                             \
   SC(keyed_store_inline_miss, V8.KeyedStoreInlineMiss)                \
   SC(named_store_global_inline, V8.NamedStoreGlobalInline)            \
   SC(named_store_global_inline_miss, V8.NamedStoreGlobalInlineMiss)   \
+  SC(keyed_store_polymorphic_stubs, V8.KeyedStorePolymorphicStubs)    \
+  SC(keyed_store_external_array_slow, V8.KeyedStoreExternalArraySlow) \
   SC(store_normal_miss, V8.StoreNormalMiss)                           \
   SC(store_normal_hit, V8.StoreNormalHit)                             \
   SC(cow_arrays_created_stub, V8.COWArraysCreatedStub)                \
@@ -199,6 +198,9 @@ namespace internal {
   SC(constructed_objects_stub, V8.ConstructedObjectsStub)             \
   SC(negative_lookups, V8.NegativeLookups)                            \
   SC(negative_lookups_miss, V8.NegativeLookupsMiss)                   \
+  SC(megamorphic_stub_cache_probes, V8.MegamorphicStubCacheProbes)    \
+  SC(megamorphic_stub_cache_misses, V8.MegamorphicStubCacheMisses)    \
+  SC(megamorphic_stub_cache_updates, V8.MegamorphicStubCacheUpdates)  \
   SC(array_function_runtime, V8.ArrayFunctionRuntime)                 \
   SC(array_function_native, V8.ArrayFunctionNative)                   \
   SC(for_in, V8.ForIn)                                                \

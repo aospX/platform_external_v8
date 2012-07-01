@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 
 // Check that we can traverse very deep stacks of ConsStrings using
 // StringInputBuffer.  Check that Get(int) works on very deep stacks
@@ -233,7 +233,7 @@ TEST(Traverse) {
   InitializeVM();
   v8::HandleScope scope;
   Handle<String> building_blocks[NUMBER_OF_BUILDING_BLOCKS];
-  ZoneScope zone(DELETE_ON_EXIT);
+  ZoneScope zone(Isolate::Current(), DELETE_ON_EXIT);
   InitializeBuildingBlocks(building_blocks);
   Handle<String> flat = ConstructBalanced(building_blocks);
   FlattenString(flat);
@@ -348,14 +348,14 @@ TEST(Utf8Conversion) {
 
 
 TEST(ExternalShortStringAdd) {
-  ZoneScope zone(DELETE_ON_EXIT);
+  ZoneScope zone(Isolate::Current(), DELETE_ON_EXIT);
 
   InitializeVM();
   v8::HandleScope handle_scope;
 
   // Make sure we cover all always-flat lengths and at least one above.
   static const int kMaxLength = 20;
-  CHECK_GT(kMaxLength, i::String::kMinNonFlatLength);
+  CHECK_GT(kMaxLength, i::ConsString::kMinLength);
 
   // Allocate two JavaScript arrays for holding short strings.
   v8::Handle<v8::Array> ascii_external_strings =
@@ -430,8 +430,7 @@ TEST(ExternalShortStringAdd) {
     "  return 0;"
     "};"
     "test()";
-  CHECK_EQ(0,
-           v8::Script::Compile(v8::String::New(source))->Run()->Int32Value());
+  CHECK_EQ(0, CompileRun(source)->Int32Value());
 }
 
 
@@ -439,7 +438,7 @@ TEST(CachedHashOverflow) {
   // We incorrectly allowed strings to be tagged as array indices even if their
   // values didn't fit in the hash field.
   // See http://code.google.com/p/v8/issues/detail?id=728
-  ZoneScope zone(DELETE_ON_EXIT);
+  ZoneScope zone(Isolate::Current(), DELETE_ON_EXIT);
 
   InitializeVM();
   v8::HandleScope handle_scope;
@@ -480,4 +479,111 @@ TEST(CachedHashOverflow) {
                result->ToInt32()->Value());
     }
   }
+}
+
+
+TEST(SliceFromCons) {
+  FLAG_string_slices = true;
+  InitializeVM();
+  v8::HandleScope scope;
+  Handle<String> string =
+      FACTORY->NewStringFromAscii(CStrVector("parentparentparent"));
+  Handle<String> parent = FACTORY->NewConsString(string, string);
+  CHECK(parent->IsConsString());
+  CHECK(!parent->IsFlat());
+  Handle<String> slice = FACTORY->NewSubString(parent, 1, 25);
+  // After slicing, the original string becomes a flat cons.
+  CHECK(parent->IsFlat());
+  CHECK(slice->IsSlicedString());
+  CHECK_EQ(SlicedString::cast(*slice)->parent(),
+           ConsString::cast(*parent)->first());
+  CHECK(SlicedString::cast(*slice)->parent()->IsSeqString());
+  CHECK(slice->IsFlat());
+}
+
+
+class AsciiVectorResource : public v8::String::ExternalAsciiStringResource {
+ public:
+  explicit AsciiVectorResource(i::Vector<const char> vector)
+      : data_(vector) {}
+  virtual ~AsciiVectorResource() {}
+  virtual size_t length() const { return data_.length(); }
+  virtual const char* data() const { return data_.start(); }
+ private:
+  i::Vector<const char> data_;
+};
+
+
+TEST(SliceFromExternal) {
+  FLAG_string_slices = true;
+  InitializeVM();
+  v8::HandleScope scope;
+  AsciiVectorResource resource(
+      i::Vector<const char>("abcdefghijklmnopqrstuvwxyz", 26));
+  Handle<String> string = FACTORY->NewExternalStringFromAscii(&resource);
+  CHECK(string->IsExternalString());
+  Handle<String> slice = FACTORY->NewSubString(string, 1, 25);
+  CHECK(slice->IsSlicedString());
+  CHECK(string->IsExternalString());
+  CHECK_EQ(SlicedString::cast(*slice)->parent(), *string);
+  CHECK(SlicedString::cast(*slice)->parent()->IsExternalString());
+  CHECK(slice->IsFlat());
+}
+
+
+TEST(TrivialSlice) {
+  // This tests whether a slice that contains the entire parent string
+  // actually creates a new string (it should not).
+  FLAG_string_slices = true;
+  InitializeVM();
+  HandleScope scope;
+  v8::Local<v8::Value> result;
+  Handle<String> string;
+  const char* init = "var str = 'abcdefghijklmnopqrstuvwxyz';";
+  const char* check = "str.slice(0,26)";
+  const char* crosscheck = "str.slice(1,25)";
+
+  CompileRun(init);
+
+  result = CompileRun(check);
+  CHECK(result->IsString());
+  string = v8::Utils::OpenHandle(v8::String::Cast(*result));
+  CHECK(!string->IsSlicedString());
+
+  string = FACTORY->NewSubString(string, 0, 26);
+  CHECK(!string->IsSlicedString());
+  result = CompileRun(crosscheck);
+  CHECK(result->IsString());
+  string = v8::Utils::OpenHandle(v8::String::Cast(*result));
+  CHECK(string->IsSlicedString());
+  CHECK_EQ("bcdefghijklmnopqrstuvwxy", *(string->ToCString()));
+}
+
+
+TEST(SliceFromSlice) {
+  // This tests whether a slice that contains the entire parent string
+  // actually creates a new string (it should not).
+  FLAG_string_slices = true;
+  InitializeVM();
+  HandleScope scope;
+  v8::Local<v8::Value> result;
+  Handle<String> string;
+  const char* init = "var str = 'abcdefghijklmnopqrstuvwxyz';";
+  const char* slice = "var slice = str.slice(1,-1); slice";
+  const char* slice_from_slice = "slice.slice(1,-1);";
+
+  CompileRun(init);
+  result = CompileRun(slice);
+  CHECK(result->IsString());
+  string = v8::Utils::OpenHandle(v8::String::Cast(*result));
+  CHECK(string->IsSlicedString());
+  CHECK(SlicedString::cast(*string)->parent()->IsSeqString());
+  CHECK_EQ("bcdefghijklmnopqrstuvwxy", *(string->ToCString()));
+
+  result = CompileRun(slice_from_slice);
+  CHECK(result->IsString());
+  string = v8::Utils::OpenHandle(v8::String::Cast(*result));
+  CHECK(string->IsSlicedString());
+  CHECK(SlicedString::cast(*string)->parent()->IsSeqString());
+  CHECK_EQ("cdefghijklmnopqrstuvwx", *(string->ToCString()));
 }
